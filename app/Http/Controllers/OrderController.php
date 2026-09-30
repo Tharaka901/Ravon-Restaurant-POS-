@@ -6,6 +6,8 @@ use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\Table;
 use App\Models\Item;
+use App\Models\RestaurantStock;
+use App\Services\TaxService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Auth;
@@ -26,13 +28,13 @@ class OrderController extends Controller
             DB::beginTransaction();
 
             $table = Table::findOrFail($validated['table_id']);
-            
+
             // Create or get existing order
             $order = $table->currentOrder;
-            
+
             if (!$order) {
                 $order = Order::create([
-                    'order_number' => 'ORD-' . date('Ymd') . '-' . str_pad(Order::whereDate('created_at', today())->count() + 1, 4, '0', STR_PAD_LEFT),
+                    'order_number' => 'ORD-' . date('Ymd') . '-' . str_pad(Order::all()->filter(fn ($orderRecord) => $orderRecord->created_at?->isToday())->count() + 1, 4, '0', STR_PAD_LEFT),
                     'table_id' => $table->id,
                     'waiter_id' => Auth::id(),
                     'status' => 'pending',
@@ -50,17 +52,31 @@ class OrderController extends Controller
             // Add items to order
             foreach ($validated['items'] as $itemData) {
                 $item = Item::findOrFail($itemData['item_id']);
-                
+
                 $subtotal = $item->price * $itemData['quantity'];
-                
+
                 OrderItem::create([
                     'order_id' => $order->id,
                     'item_id' => $item->id,
                     'quantity' => $itemData['quantity'],
+                    'latest_added_quantity' => $itemData['quantity'],
+                    'delivered_quantity' => 0,
                     'unit_price' => $item->price,
                     'subtotal' => $subtotal,
+                    'status' => 'preparing',
+                    'preparing_at' => now(),
                     'special_instructions' => $itemData['special_instructions'] ?? null,
                 ]);
+
+                // Deduct from restaurant stock for finished goods items
+                if ($item->is_finished_goods) {
+                    RestaurantStock::deductForSale(
+                        $item->id,
+                        null, // No modifier support in simple order controller
+                        $itemData['quantity'],
+                        Auth::id()
+                    );
+                }
             }
 
             // Recalculate order totals
@@ -73,7 +89,6 @@ class OrderController extends Controller
                 'message' => 'Items added to order successfully',
                 'order' => $order->load('items.item')
             ]);
-
         } catch (\Exception $e) {
             DB::rollBack();
             return response()->json([
@@ -94,14 +109,18 @@ class OrderController extends Controller
             DB::beginTransaction();
 
             $order = Order::findOrFail($id);
-            $orderItem = OrderItem::where('order_id', $order->id)
+            $orderItem = OrderItem::query()->where('order_id', $order->id)
                 ->where('id', $validated['item_id'])
                 ->firstOrFail();
 
-            $orderItem->update([
+            $trackingUpdate = $validated['quantity'] > $orderItem->quantity
+                ? $orderItem->quantityIncreaseTrackingAttributes($validated['quantity'])
+                : $orderItem->quantityDecreaseTrackingAttributes($validated['quantity']);
+
+            $orderItem->update(array_merge($trackingUpdate, [
                 'quantity' => $validated['quantity'],
                 'subtotal' => $orderItem->unit_price * $validated['quantity'],
-            ]);
+            ]));
 
             $this->recalculateOrderTotals($order);
 
@@ -112,7 +131,6 @@ class OrderController extends Controller
                 'message' => 'Order updated successfully',
                 'order' => $order->load('items.item')
             ]);
-
         } catch (\Exception $e) {
             DB::rollBack();
             return response()->json([
@@ -129,11 +147,12 @@ class OrderController extends Controller
 
             $orderItem = OrderItem::findOrFail($id);
             $order = $orderItem->order;
-            
-            $orderItem->delete();
 
-            // If no items left, delete the order and update table
-            if ($order->items()->count() === 0) {
+            // Mark item as deleted instead of hard delete
+            $orderItem->update(['status' => 'deleted']);
+
+            // If no active items left, delete the order and update table
+            if ($order->items()->active()->count() === 0) {
                 $table = $order->table;
                 if ($table) {
                     $table->update([
@@ -152,7 +171,6 @@ class OrderController extends Controller
                 'success' => true,
                 'message' => 'Item removed successfully'
             ]);
-
         } catch (\Exception $e) {
             DB::rollBack();
             return response()->json([
@@ -164,15 +182,16 @@ class OrderController extends Controller
 
     private function recalculateOrderTotals($order)
     {
-        $subtotal = $order->items()->sum('subtotal');
-        $taxRate = 0.10; // 10% tax
-        $taxAmount = $subtotal * $taxRate;
-        $total = $subtotal + $taxAmount;
+        $taxService = app(TaxService::class);
+        $activeItems = $order->items()->active()->with('item')->get();
+        $taxTotals = $taxService->calculateOrderTax($activeItems);
 
         $order->update([
-            'subtotal' => $subtotal,
-            'tax_amount' => $taxAmount,
-            'total_amount' => $total,
+            'subtotal' => $taxTotals['subtotal'],
+            'sscl_amount' => $taxTotals['sscl_amount'],
+            'vat_amount' => $taxTotals['vat_amount'],
+            'tax_amount' => $taxTotals['tax_amount'],
+            'total_amount' => $taxTotals['total_amount'],
         ]);
     }
 }

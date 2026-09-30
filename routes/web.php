@@ -2,12 +2,25 @@
 
 use Illuminate\Support\Facades\Route;
 use App\Http\Controllers\DashboardController;
-use App\Http\Controllers\TableController;
 use App\Http\Controllers\OrderController;
 use App\Http\Controllers\MenuController;
 use App\Http\Controllers\PaymentController;
-use App\Http\Controllers\KitchenController;
-use App\Http\Controllers\ReportController;
+use App\Http\Controllers\SalesReportController;
+use App\Http\Controllers\ItemSalesReportController;
+use App\Http\Controllers\ItemTransactionReportController;
+use App\Http\Controllers\OrderDeliveredReportController;
+use App\Http\Controllers\UserController;
+use App\Http\Controllers\VoidReportController;
+use App\Http\Controllers\WastageController;
+use App\Http\Controllers\WastageReportController;
+use App\Http\Controllers\VatCustomerController;
+use App\Http\Controllers\VatReportController;
+use App\Http\Controllers\RmReportController;
+use App\Http\Controllers\RmSalesReportController;
+use App\Http\Controllers\SpecialSalesReportController;
+use App\Http\Controllers\Admin\Analysis\LastOrderDateController;
+use App\Http\Controllers\Admin\Analysis\CostReportController;
+use App\Http\Controllers\PriceListActivityController;
 
 Route::get('/', function () {
     return redirect()->route('login');
@@ -23,18 +36,10 @@ Route::post('/logout', [App\Http\Controllers\Auth\LoginController::class, 'logou
 
 // Protected routes
 Route::middleware(['auth'])->group(function () {
-    
+
     // Dashboard
     Route::get('/dashboard', [DashboardController::class, 'index'])->name('dashboard');
-    
-    // Tables
-    Route::get('/tables', [TableController::class, 'index'])->name('tables.index');
-    Route::get('/tables/{table}', [TableController::class, 'show'])->name('tables.show');
-    Route::post('/tables/{table}/select', [TableController::class, 'select'])->name('tables.select');
-    Route::post('/tables/merge', [TableController::class, 'merge'])->name('tables.merge');
-    Route::post('/tables/{table}/split', [TableController::class, 'split'])->name('tables.split');
-    Route::post('/tables/{table}/transfer', [TableController::class, 'transfer'])->name('tables.transfer');
-    
+
     // Orders
     Route::post('/orders', [OrderController::class, 'store'])->name('orders.store');
     Route::put('/orders/{order}', [OrderController::class, 'update'])->name('orders.update');
@@ -42,26 +47,54 @@ Route::middleware(['auth'])->group(function () {
     Route::post('/orders/{order}/items', [OrderController::class, 'addItem'])->name('orders.addItem');
     Route::post('/orders/{order}/discount', [OrderController::class, 'applyDiscount'])->name('orders.discount');
     Route::post('/orders/{order}/cancel', [OrderController::class, 'cancel'])->name('orders.cancel');
-    
-    // Menu Management (Admin only)
-    Route::middleware(['role:admin'])->prefix('menu')->name('menu.')->group(function () {
+
+    // Menu Management (Admin & SuperAdmin only)
+    Route::middleware(['role:superadmin'])->prefix('menu')->name('menu.')->group(function () {
         Route::get('/', [MenuController::class, 'index'])->name('index');
-        Route::get('/categories/create', [MenuController::class, 'createCategory'])->name('categories.create');
+
+        // Category routes
+        Route::get('/categories', [MenuController::class, 'indexCategories'])->name('categories.index');
         Route::post('/categories', [MenuController::class, 'storeCategory'])->name('categories.store');
+        Route::put('/categories/{category}', [MenuController::class, 'updateCategory'])->name('categories.update');
+        Route::delete('/categories/{category}', [MenuController::class, 'destroyCategory'])->name('categories.destroy');
+
+        // Item routes
         Route::get('/items/create', [MenuController::class, 'createItem'])->name('items.create');
         Route::post('/items', [MenuController::class, 'storeItem'])->name('items.store');
+        Route::get('/items/export-price-list', [MenuController::class, 'exportPriceList'])->name('items.export-price-list');
         Route::get('/items/{item}/edit', [MenuController::class, 'editItem'])->name('items.edit');
         Route::put('/items/{item}', [MenuController::class, 'updateItem'])->name('items.update');
         Route::delete('/items/{item}', [MenuController::class, 'destroyItem'])->name('items.destroy');
+        Route::post('/items/{id}/activate', [MenuController::class, 'activateItem'])->name('items.activate');
+
+        // Modifier routes
+        Route::post('/items/{item}/modifiers', [MenuController::class, 'storeModifier'])->name('modifiers.store');
+        Route::put('/modifiers/{modifier}', [MenuController::class, 'updateModifier'])->name('modifiers.update');
+        Route::delete('/modifiers/{modifier}', [MenuController::class, 'destroyModifier'])->name('modifiers.destroy');
+        Route::post('/modifiers/{id}/activate', [MenuController::class, 'activateModifier'])->name('modifiers.activate');
+
+
+
+        // Price List Activity
+        Route::get('/price-list-activity', [PriceListActivityController::class, 'index'])->name('price-list-activity.index');
+        Route::get('/price-list-activity/export', [PriceListActivityController::class, 'exportExcel'])->name('price-list-activity.export');
     });
-    
-    // Kitchen Display (Kitchen staff)
+
+    // RM Report (Supervisor & SuperAdmin only)
+    Route::middleware(['role:supervisor|superadmin'])->prefix('menu')->name('menu.')->group(function () {
+        Route::get('/rm-report', [RmReportController::class, 'index'])->name('rm-report.index');
+        Route::get('/rm-report/export', [RmReportController::class, 'exportExcel'])->name('rm-report.export');
+        Route::put('/rm-report/{recipe}', [RmReportController::class, 'update'])->name('rm-report.update');
+        Route::delete('/rm-report/{recipe}', [RmReportController::class, 'destroy'])->name('rm-report.destroy');
+    });
+
+    // Kitchen Display (Kitchen staff) - Placeholder routes
     Route::middleware(['role:kitchen|admin'])->prefix('kitchen')->name('kitchen.')->group(function () {
-        Route::get('/', [KitchenController::class, 'index'])->name('index');
-        Route::post('/kot/{kot}/status', [KitchenController::class, 'updateStatus'])->name('kot.status');
-        Route::post('/kot/{kot}/reprint', [KitchenController::class, 'reprint'])->name('kot.reprint');
+        Route::get('/', function () {
+            return view('dashboard');
+        })->name('index');
     });
-    
+
     // Payments (Cashier)
     Route::middleware(['role:cashier|admin'])->prefix('payments')->name('payments.')->group(function () {
         Route::get('/', [PaymentController::class, 'index'])->name('index');
@@ -70,21 +103,240 @@ Route::middleware(['auth'])->group(function () {
         Route::post('/refund/{payment}', [PaymentController::class, 'refund'])->name('refund');
         Route::get('/daily-summary', [PaymentController::class, 'dailySummary'])->name('daily-summary');
     });
-    
-    // Reports (Admin & Cashier)
-    Route::middleware(['role:admin|cashier'])->prefix('reports')->name('reports.')->group(function () {
-        Route::get('/', [ReportController::class, 'index'])->name('index');
-        Route::get('/daily-sales', [ReportController::class, 'dailySales'])->name('daily-sales');
-        Route::get('/item-sales', [ReportController::class, 'itemSales'])->name('item-sales');
-        Route::get('/staff-performance', [ReportController::class, 'staff-performance'])->name('staff-performance');
-        Route::get('/export', [ReportController::class, 'export'])->name('export');
+
+    // Reports routes grouped by prefix
+    Route::prefix('reports')->name('reports.')->group(function () {
+        // Item Sales (part of Details/Sales Reports for Admin)
+        Route::middleware(['role:cashier|superadmin'])->group(function () {
+            Route::get('/item-sales', [ItemSalesReportController::class, 'index'])->name('item-sales');
+            Route::post('/item-sales/filter', [ItemSalesReportController::class, 'filter'])->name('item-sales.filter');
+            Route::post('/item-sales/details', [ItemSalesReportController::class, 'getItemDetails'])->name('item-sales.details');
+            Route::get('/item-sales/export', [ItemSalesReportController::class, 'exportSummary'])->name('item-sales.export');
+            Route::get('/item-sales/export-details', [ItemSalesReportController::class, 'exportItemDetails'])->name('item-sales.export-details');
+        });
+
+        // RM Reports (part of RM for Supervisor)
+        Route::middleware(['role:supervisor|cashier|superadmin'])->group(function () {
+            Route::get('/item-transactions', [ItemTransactionReportController::class, 'index'])->name('item-transactions');
+            Route::post('/item-transactions/data', [ItemTransactionReportController::class, 'data'])->name('item-transactions.data');
+            Route::get('/rm-sales', [RmSalesReportController::class, 'index'])->name('rm-sales');
+            Route::post('/rm-sales/filter', [RmSalesReportController::class, 'filter'])->name('rm-sales.filter');
+            Route::post('/rm-sales/details', [RmSalesReportController::class, 'getOrderDetails'])->name('rm-sales.details');
+        });
+
+        // Other general report routes
+        Route::middleware(['role:admin|cashier|manager|superadmin'])->group(function () {
+            Route::get('/', function () {
+                return view('dashboard');
+            })->name('index');
+            Route::get('/daily-sales', function () {
+                return view('dashboard');
+            })->name('daily-sales');
+            Route::get('/staff-performance', function () {
+                return view('dashboard');
+            })->name('staff-performance');
+            Route::get('/export', function () {
+                return redirect()->route('dashboard');
+            })->name('export');
+        });
     });
-    
-    // POS (Cashier & Admin)
-    Route::middleware(['role:cashier|admin'])->prefix('pos')->name('pos.')->group(function () {
+
+    // Sales Report (SuperAdmin only)
+    Route::middleware(['role:superadmin'])->prefix('sales-report')->name('sales-report.')->group(function () {
+        Route::get('/', [SalesReportController::class, 'index'])->name('index');
+        Route::get('/sale-details/{order}', [SalesReportController::class, 'getSaleDetails'])->name('sale-details');
+        Route::get('/order/{order}/edit', [SalesReportController::class, 'edit'])->middleware('role:superadmin')->name('edit');
+        Route::put('/order/{order}', [SalesReportController::class, 'update'])->middleware('role:superadmin')->name('update');
+        Route::get('/receipt/{order}', [SalesReportController::class, 'receipt'])->name('receipt');
+        Route::get('/export', [SalesReportController::class, 'exportExcel'])->name('export');
+        Route::delete('/order/{order}', [SalesReportController::class, 'softDelete'])->name('order.delete');
+    });
+
+    // Special Sales Report (Admin & SuperAdmin only)
+    Route::middleware(['role:admin|superadmin'])->prefix('special-sales-report')->name('special-sales-report.')->group(function () {
+        Route::get('/', [SpecialSalesReportController::class, 'index'])->name('index');
+    });
+
+    // Void Report (Manager & SuperAdmin only)
+    Route::middleware(['role:manager|superadmin'])->prefix('void-report')->name('void-report.')->group(function () {
+        Route::get('/', [VoidReportController::class, 'index'])->name('index');
+        Route::get('/export', [VoidReportController::class, 'export'])->name('export');
+        Route::get('/{voidRecord}', [VoidReportController::class, 'getDetails'])->name('details');
+    });
+
+    // User Management (Admin & SuperAdmin only)
+    Route::middleware(['role:admin|superadmin'])->prefix('users')->name('users.')->group(function () {
+        Route::get('/', [UserController::class, 'index'])->name('index');
+        Route::post('/', [UserController::class, 'store'])->name('store');
+        Route::get('/{user}', [UserController::class, 'show'])->name('show');
+        Route::put('/{user}', [UserController::class, 'update'])->name('update');
+        Route::delete('/{user}', [UserController::class, 'destroy'])->name('destroy');
+    });
+
+    // VAT Customer Registration (Admin & SuperAdmin only)
+    Route::middleware(['role:admin|superadmin'])->prefix('vat-customers')->name('vat-customers.')->group(function () {
+        Route::get('/', [VatCustomerController::class, 'index'])->name('index');
+        Route::post('/', [VatCustomerController::class, 'store'])->name('store');
+        Route::put('/{vatCustomer}', [VatCustomerController::class, 'update'])->name('update');
+    });
+
+    Route::middleware(['role:superadmin|manager'])->prefix('super-admin-reports')->name('super-admin-reports.')->group(function () {
+        Route::get('/order-delivered', [OrderDeliveredReportController::class, 'index'])->name('order-delivered.index');
+        Route::get('/order-delivered/item-details', [OrderDeliveredReportController::class, 'itemDetails'])->name('order-delivered.details');
+        Route::get('/order-delivered/print', [OrderDeliveredReportController::class, 'print'])->name('order-delivered.print');
+        Route::get('/order-delivered/export', [OrderDeliveredReportController::class, 'exportExcel'])->name('order-delivered.export');
+    });
+
+    // Analysis Reports (SuperAdmin only)
+    Route::middleware(['role:manager|superadmin'])->prefix('admin/analysis')->name('analysis.')->group(function () {
+        Route::get('/last-order-date', [LastOrderDateController::class, 'index'])->name('last-order-date');
+        Route::get('/last-order-date/export', [LastOrderDateController::class, 'exportExcel'])->name('last-order-date.export');
+
+        // Cost Report
+        Route::get('/cost-report', [CostReportController::class, 'index'])->name('cost-report');
+        Route::get('/cost-report/export', [CostReportController::class, 'exportExcel'])->name('cost-report.export');
+    });
+
+    // POS (Cashier only)
+    Route::middleware(['role:cashier'])->prefix('pos')->name('pos.')->group(function () {
         Route::get('/', [App\Http\Controllers\POSController::class, 'index'])->name('index');
         Route::get('/item/{id}', [App\Http\Controllers\POSController::class, 'getItem'])->name('getItem');
-        Route::post('/process', [App\Http\Controllers\POSController::class, 'processOrder'])->name('process');
+        Route::get('/item-recipes', [App\Http\Controllers\POSController::class, 'getItemRecipes'])->name('itemRecipes');
+        Route::get('/tables', [App\Http\Controllers\POSController::class, 'getAvailableTables'])->name('tables');
+        Route::get('/open-checks', [App\Http\Controllers\POSController::class, 'getOpenChecks'])->name('openChecks');
+        Route::get('/closed-orders', [App\Http\Controllers\POSController::class, 'getClosedOrders'])->name('closedOrders');
+        Route::get('/order/{orderId}', [App\Http\Controllers\POSController::class, 'getOrder'])->name('getOrder');
+        Route::post('/place-order', [App\Http\Controllers\POSController::class, 'placeOrder'])->name('placeOrder');
+        Route::post('/payment', [App\Http\Controllers\POSController::class, 'processPayment'])->name('payment');
         Route::get('/receipt/{orderId}', [App\Http\Controllers\POSController::class, 'printReceipt'])->name('receipt');
+        Route::post('/verify-supervisor-pin', [App\Http\Controllers\POSController::class, 'verifySupervisorPin'])->name('verifySupervisorPin');
+        Route::post('/void-items', [App\Http\Controllers\POSController::class, 'voidItems'])->name('voidItems');
+        Route::post('/cancel-voided-order', [App\Http\Controllers\POSController::class, 'cancelVoidedOrder'])->name('cancelVoidedOrder');
+        Route::post('/transfer-table', [App\Http\Controllers\POSController::class, 'transferTable'])->name('transferTable');
+        Route::post('/merge-order', [App\Http\Controllers\POSController::class, 'mergeOrder'])->name('mergeOrder');
+        Route::post('/order-item/update-delivery', [App\Http\Controllers\POSController::class, 'updateOrderItemDelivery'])->name('orderItem.updateDelivery');
+        Route::post('/order-item/supervisor-override', [App\Http\Controllers\POSController::class, 'supervisorOverrideOrderItemDelivery'])->name('orderItem.supervisorOverride');
+        Route::post('/order-items/{orderItem}/deliver', [App\Http\Controllers\POSController::class, 'markOrderItemDelivered'])->name('orderItems.deliver');
+        Route::post('/order-items/{orderItem}/prepare', [App\Http\Controllers\POSController::class, 'markOrderItemPreparing'])->name('orderItems.prepare');
+        Route::get('/order/{orderId}/logs', [App\Http\Controllers\POSController::class, 'getOrderLogs'])->name('orderLogs');
     });
+
+    // Stock Management Routes
+    Route::prefix('stock')->name('stock.')->group(function () {
+        // Cashier routes
+        Route::middleware(['role:cashier'])->group(function () {
+            Route::get('/cashier', [App\Http\Controllers\StockRequestController::class, 'cashierIndex'])->name('cashier.index');
+            Route::get('/my-stock', [App\Http\Controllers\StockRequestController::class, 'cashierStock'])->name('cashier.stock');
+            Route::post('/', [App\Http\Controllers\StockRequestController::class, 'store'])->name('store');
+            Route::get('/my-requests', [App\Http\Controllers\StockRequestController::class, 'getCashierRequests'])->name('my-requests');
+            Route::post('/{stockRequest}/cashier-respond', [App\Http\Controllers\StockRequestController::class, 'cashierRespond'])->name('cashier.respond');
+        });
+
+        // Supervisor routes (only supervisors can approve/reject stock requests)
+        Route::middleware(['role:supervisor'])->group(function () {
+            Route::get('/supervisor', [App\Http\Controllers\StockRequestController::class, 'supervisorIndex'])->name('supervisor.index');
+            Route::post('/{stockRequest}/supervisor-respond', [App\Http\Controllers\StockRequestController::class, 'supervisorRespond'])->name('supervisor.respond');
+        });
+
+        // Shared routes (accessible by both)
+        Route::get('/{stockRequest}', [App\Http\Controllers\StockRequestController::class, 'show'])->name('show');
+        Route::get('/items/list', [App\Http\Controllers\StockRequestController::class, 'getItems'])->name('items');
+    });
+
+    // Main Stock Management Routes (Supervisor & SuperAdmin)
+    Route::middleware(['role:supervisor|cashier|superadmin'])->prefix('main-stock')->name('main-stock.')->group(function () {
+        // Stock Items CRUD
+        Route::get('/', [App\Http\Controllers\MainStockController::class, 'index'])->name('index');
+        Route::get('/create', [App\Http\Controllers\MainStockController::class, 'create'])->name('create');
+        Route::post('/', [App\Http\Controllers\MainStockController::class, 'store'])->name('store');
+        Route::get('/{mainStock}/edit', [App\Http\Controllers\MainStockController::class, 'edit'])->name('edit');
+        Route::put('/{mainStock}', [App\Http\Controllers\MainStockController::class, 'update'])->name('update');
+
+        // Soft delete / Deleted Items / Reactivate (Super Admin only)
+        Route::middleware(['role:superadmin'])->group(function () {
+            Route::delete('/{mainStock}', [App\Http\Controllers\MainStockController::class, 'destroy'])->name('destroy');
+            Route::get('/deleted-items', [App\Http\Controllers\MainStockController::class, 'deletedItems'])->name('deleted');
+            Route::patch('/{mainStock}/reactivate', [App\Http\Controllers\MainStockController::class, 'reactivate'])->name('reactivate');
+        });
+
+        // Stock Operations
+        Route::get('/stock-update', [App\Http\Controllers\MainStockController::class, 'showStockUpdate'])->name('stock-update');
+        Route::post('/stock-update', [App\Http\Controllers\MainStockController::class, 'processStockUpdate'])->name('process-stock-update');
+
+        // AJAX endpoints
+        Route::get('/item/{mainStock}', [App\Http\Controllers\MainStockController::class, 'getItem'])->name('get-item');
+        Route::get('/generate-code', [App\Http\Controllers\MainStockController::class, 'generateCode'])->name('generate-code');
+    });
+
+    // Stock Transfer Routes (Supervisor to Cashier transfers)
+    Route::prefix('stock-transfer')->name('stock-transfer.')->group(function () {
+        // Supervisor routes - create and manage transfers (Supervisor only)
+        Route::middleware(['role:supervisor|cashier|superadmin'])->group(function () {
+            Route::get('/supervisor', [App\Http\Controllers\StockTransferController::class, 'supervisorIndex'])->name('supervisor.index');
+            Route::post('/', [App\Http\Controllers\StockTransferController::class, 'store'])->name('store');
+            Route::get('/history', [App\Http\Controllers\StockTransferController::class, 'getTransferHistory'])->name('history');
+        });
+
+        // Cashier routes - receive and respond to transfers (Supervisor only)
+        Route::middleware(['role:supervisor|cashier|superadmin'])->group(function () {
+            Route::get('/cashier', [App\Http\Controllers\StockTransferController::class, 'cashierIndex'])->name('cashier.index');
+            Route::post('/{stockTransfer}/respond', [App\Http\Controllers\StockTransferController::class, 'cashierRespond'])->name('cashier.respond');
+            Route::get('/pending', [App\Http\Controllers\StockTransferController::class, 'getPendingTransfers'])->name('pending');
+        });
+
+        // Sub Stock routes - My Stock (Supervisor & Manager/Manoj)
+        Route::middleware(['role:supervisor|manager|cashier|superadmin'])->group(function () {
+            Route::get('/cashier/sub-stock', [App\Http\Controllers\StockTransferController::class, 'cashierSubStock'])->name('cashier.sub-stock');
+            Route::get('/sub-stock-data', [App\Http\Controllers\StockTransferController::class, 'getSubStock'])->name('sub-stock-data');
+        });
+
+        // Shared route - view transfer details (Supervisor, Manager/Manoj, Superadmin)
+        Route::middleware(['role:supervisor|manager|cashier|superadmin'])->group(function () {
+            Route::get('/{stockTransfer}', [App\Http\Controllers\StockTransferController::class, 'show'])->name('show');
+        });
+    });
+
+    // Stock Adjustment Routes (Admin & SuperAdmin only)
+    Route::middleware(['role:superadmin|manager'])->prefix('stock-adjustment')->name('stock-adjustment.')->group(function () {
+        Route::get('/', [App\Http\Controllers\StockAdjustmentController::class, 'index'])->name('index');
+        Route::post('/', [App\Http\Controllers\StockAdjustmentController::class, 'store'])->name('store');
+        Route::get('/item/{item}', [App\Http\Controllers\StockAdjustmentController::class, 'getItemDetails'])->name('item-details');
+        Route::get('/history', [App\Http\Controllers\StockAdjustmentController::class, 'history'])->name('history');
+        Route::get('/history-data', [App\Http\Controllers\StockAdjustmentController::class, 'getHistory'])->name('get-history');
+    });
+
+    // Wastage Routes (Supervisor & SuperAdmin)
+    Route::middleware(['role:cashier|supervisor|superadmin'])->prefix('wastage')->name('wastage.')->group(function () {
+        Route::get('/', [WastageController::class, 'index'])->name('index');
+        Route::post('/', [WastageController::class, 'store'])->name('store');
+        Route::get('/item/{item}', [WastageController::class, 'getItemDetails'])->name('item-details');
+        Route::get('/history', [WastageController::class, 'history'])->name('history');
+    });
+
+    // Wastage Report Routes (Manager & SuperAdmin)
+    Route::middleware(['role:manager|superadmin'])->prefix('wastage-report')->name('wastage-report.')->group(function () {
+        Route::get('/', [WastageReportController::class, 'index'])->name('index');
+        Route::get('/data', [WastageReportController::class, 'getData'])->name('data');
+        Route::get('/export', [WastageReportController::class, 'exportExcel'])->name('export');
+    });
+
+    // VAT Report Routes (Admin & SuperAdmin only)
+    Route::middleware(['role:admin|superadmin'])->prefix('vat-report')->name('vat-report.')->group(function () {
+        Route::get('/', [VatReportController::class, 'index'])->name('index');
+        Route::get('/export', [VatReportController::class, 'exportExcel'])->name('export');
+        Route::get('/sale-details/{order}', [VatReportController::class, 'getSaleDetails'])->name('sale-details');
+    });
+
+    // QZ Tray Signature Route (for thermal printing)
+    Route::post('/qz/sign', [App\Http\Controllers\QZTrayController::class, 'signQzRequest'])->name('qz.sign');
+
+    // Settings (Admin & SuperAdmin only)
+    Route::middleware(['role:admin|superadmin'])->prefix('settings')->name('settings.')->group(function () {
+        Route::get('/', [App\Http\Controllers\SettingController::class, 'index'])->name('index');
+        Route::post('/', [App\Http\Controllers\SettingController::class, 'store'])->name('store');
+    });
+
+    // Inactive endpoints (APIs returning JSON)
+    Route::get('/menu-items/inactive', [MenuController::class, 'inactiveItems'])->name('menu.items.inactive');
+    Route::get('/menu-item-portions/inactive', [MenuController::class, 'inactivePortions'])->name('menu.portions.inactive');
 });

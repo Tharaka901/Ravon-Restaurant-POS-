@@ -19,10 +19,8 @@ class User extends Authenticatable
     protected $fillable = [
         'name',
         'username',
-        'email',
         'password',
-        'phone',
-        'employee_id',
+        'pin',
         'is_active',
         'last_login_at',
     ];
@@ -45,7 +43,6 @@ class User extends Authenticatable
     protected function casts(): array
     {
         return [
-            'email_verified_at' => 'datetime',
             'password' => 'hashed',
             'is_active' => 'boolean',
             'last_login_at' => 'datetime',
@@ -74,14 +71,6 @@ class User extends Authenticatable
     public function processedPayments()
     {
         return $this->hasMany(Payment::class, 'processed_by');
-    }
-
-    /**
-     * Get audit logs.
-     */
-    public function auditLogs()
-    {
-        return $this->hasMany(AuditLog::class);
     }
 
     /**
@@ -130,5 +119,52 @@ class User extends Authenticatable
     public function isKitchen(): bool
     {
         return $this->hasRole('kitchen');
+    }
+
+    /**
+     * Check if user is supervisor.
+     */
+    public function isSupervisor(): bool
+    {
+        return $this->hasRole('supervisor');
+    }
+
+    /**
+     * Get the dynamic PIN that changes every 5 minutes.
+     * This PIN is calculated based on current time + user ID.
+     * The generated PIN is also saved to the database.
+     */
+    public function getDynamicPinAttribute(): ?string
+    {
+        // Only supervisors have PINs
+        if (!$this->hasRole('supervisor')) {
+            return null;
+        }
+
+        // Get the current 5-minute time slot (changes every 5 minutes)
+        $timeSlot = floor(time() / 300); // 300 seconds = 5 minutes
+
+        // Create a unique seed using user ID and time slot
+        $seed = $this->id + $timeSlot;
+
+        // Use the seed to generate a deterministic "random" PIN
+        mt_srand($seed);
+        $newPin = str_pad(mt_rand(0, 9999), 4, '0', STR_PAD_LEFT);
+
+        // Reset the random seed to avoid affecting other random operations
+        mt_srand();
+
+        // Save the PIN to the database if it has changed
+        if ($this->pin !== $newPin) {
+            // Use query builder to avoid triggering model events and infinite loops
+            \Illuminate\Support\Facades\DB::table('users')
+                ->where('id', $this->id)
+                ->update(['pin' => $newPin]);
+
+            // Update the model's attribute as well
+            $this->attributes['pin'] = $newPin;
+        }
+
+        return $newPin;
     }
 }

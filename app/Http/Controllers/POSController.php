@@ -8,18 +8,30 @@ use App\Models\Table;
 use App\Models\Order;
 use App\Models\OrderItem;
 use App\Models\Payment;
+use App\Models\Kot;
+use App\Models\KotItem;
+use App\Models\CashierSubStock;
+use App\Models\CashierFgStockLog;
+use App\Models\CashierRmStockLog;
+use App\Models\ItemRecipe;
+use App\Models\ItemModifier;
+use App\Models\OrderItemDeliveryAudit;
+use App\Models\OrderItemPreparationLog;
+use App\Models\VoidRecord;
+use App\Models\OrderLog;
+use App\Services\TaxService;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 
 class POSController extends Controller
 {
-    /**
-     * Constructor
-     */
-    public function __construct()
+    private TaxService $taxService;
+
+    public function __construct(TaxService $taxService)
     {
-        // No service dependencies needed
+        $this->taxService = $taxService;
     }
 
     /**
@@ -29,14 +41,22 @@ class POSController extends Controller
     {
         $categories = Category::active()
             ->ordered()
-            ->with(['availableItems' => function ($query) {
-                $query->available()->orderBy('display_order')->with('modifiers');
-            }])
+            ->with([
+                'availableItems' => function ($query) {
+                    $query->available()->orderBy('display_order')
+                        ->with(['modifiers.itemPrices', 'itemPrices']);
+                }
+            ])
             ->get();
 
-        $tables = Table::orderBy('table_number')->get();
+        $tables = Table::orderByRaw("CAST(SUBSTRING(table_number, 2) AS UNSIGNED)")->get();
+        
+        $settings = \App\Models\Setting::first();
+        $vatRate = $settings ? ($settings->vat ?? 0) : 0;
+        $ssclRate = $settings ? ($settings->sscl ?? 0) : 0;
+        $vatRegNo = $settings ? ($settings->vat_reg_no ?? '') : '';
 
-        return view('pos.index', compact('categories', 'tables'));
+        return view('pos.index', compact('categories', 'tables', 'vatRate', 'ssclRate', 'vatRegNo'));
     }
 
     /**
@@ -44,9 +64,11 @@ class POSController extends Controller
      */
     public function getItem($id)
     {
-        $item = Item::with(['modifiers' => function ($query) {
-            $query->where('is_active', true);
-        }])->findOrFail($id);
+        $item = Item::with([
+            'modifiers' => function ($query) {
+                $query->where('is_active', true);
+            }
+        ])->findOrFail($id);
 
         return response()->json([
             'success' => true,
@@ -55,123 +77,1602 @@ class POSController extends Controller
     }
 
     /**
-     * Process POS order and payment.
+     * Get recipes/ingredients for a menu item or modifier (portion).
+     * Used by the POS ingredient selector modal when pork_available is true.
      */
-    public function processOrder(Request $request)
+    public function getItemRecipes(Request $request)
+    {
+        $itemId = $request->input('item_id');
+        $modifierId = $request->input('modifier_id');
+
+        $item = Item::findOrFail($itemId);
+
+        // Get recipes for this specific item/modifier
+        $query = ItemRecipe::where('item_id', $itemId)
+            ->with('mainStockItem');
+
+        if ($modifierId) {
+            // If a specific portion/modifier is selected, get its recipes
+            $query->where('item_modifier_id', $modifierId);
+        } else {
+            // For items without portions, get item-level recipes
+            $query->whereNull('item_modifier_id');
+        }
+
+        $recipes = $query->get();
+
+        // Fallback: if modifier was specified but no portion-specific recipes found, try item-level
+        if ($recipes->isEmpty() && $modifierId) {
+            $recipes = ItemRecipe::where('item_id', $itemId)
+                ->whereNull('item_modifier_id')
+                ->with('mainStockItem')
+                ->get();
+        }
+
+        $mappedRecipes = $recipes->map(function ($recipe) {
+            return [
+                'id' => $recipe->id,
+                'main_stock_item_id' => $recipe->main_stock_item_id,
+                'ingredient_name' => $recipe->mainStockItem->item_name ?? 'Unknown',
+                'quantity' => $recipe->quantity,
+                'unit' => $recipe->mainStockItem->unit_abbreviation ?? '',
+            ];
+        });
+
+        return response()->json([
+            'success' => true,
+            'recipes' => $mappedRecipes,
+        ]);
+    }
+
+    /**
+     * Get available tables
+     */
+    public function getAvailableTables()
+    {
+        $tables = Table::with('currentOrder')
+            ->orderByRaw("CAST(SUBSTRING(table_number, 2) AS UNSIGNED)")
+            ->get()
+            ->map(function ($table) {
+                return [
+                    'id' => $table->id,
+                    'table_number' => $table->table_number,
+                    'status' => $table->status,
+                    'is_available' => $table->status === 'available',
+                    'current_order_id' => $table->current_order_id,
+                ];
+            });
+
+        return response()->json([
+            'success' => true,
+            'tables' => $tables
+        ]);
+    }
+
+    /**
+     * Get open checks (orders)
+     */
+    public function getOpenChecks()
+    {
+        // Log the request for debugging
+        Log::info('Open Checks requested', [
+            'user_id' => Auth::id(),
+            'user_name' => Auth::user() ? Auth::user()->name : 'Not logged in',
+            'time' => now()->toDateTimeString(),
+        ]);
+
+        $openOrders = Order::with(['table', 'activeItems.item'])
+            ->where('status', 'pending')
+            ->where('is_paid', false)
+            ->orderBy('created_at', 'desc')
+            ->get()
+            ->map(function ($order) {
+                // Include only items that are still active for cashier actions.
+                $activeItems = $order->activeItems->filter(function ($item) {
+                    return !in_array($item->status, ['cancelled', 'deleted']);
+                });
+
+                $activeItemsCount = $activeItems->count();
+
+                $items = $activeItems->map(function ($item) {
+                    $isDelivered = $item->status === 'delivered';
+
+                    return [
+                        'id' => $item->id,
+                        'name' => $item->item_display_name ?? $item->item->name ?? 'Unknown Item',
+                        'quantity' => $item->quantity,
+                        // UI only needs two states for cashier flow.
+                        'status' => $isDelivered ? 'delivered' : 'preparing',
+                    ];
+                })->values();
+
+                return [
+                    'id' => $order->id,
+                    'order_number' => $order->order_number,
+                    'table_number' => $order->table ? $order->table->table_number : 'N/A',
+                    'order_type' => $order->order_type,
+                    'pickme_ref_number' => $order->pickme_ref_number,
+                    'total_amount' => $order->total_amount,
+                    'created_at' => $order->created_at->format('M d, h:i A'),
+                    'items_count' => $activeItemsCount,
+                    'items' => $items,
+                ];
+            });
+
+        return response()->json([
+            'success' => true,
+            'orders' => $openOrders
+        ]);
+    }
+
+    /**
+     * Get closed/completed orders (paid orders)
+     */
+    public function getClosedOrders()
+    {
+        // Get today's date (start of day and end of day)
+        $todayStart = now()->startOfDay();
+        $todayEnd = now()->endOfDay();
+
+        $closedOrders = Order::with(['table', 'activeItems.item', 'payment'])
+            ->where(function ($q) {
+                $q->where('status', 'completed')
+                    ->orWhere('is_paid', true);
+            })
+            ->where('is_deleted', false)
+            // Filter for TODAY only
+            ->whereBetween('completed_at', [$todayStart, $todayEnd])
+            ->orderBy('completed_at', 'desc')
+            ->get()
+            ->map(function ($order) {
+                // Count only non-cancelled items
+                $activeItemsCount = $order->orderItems->filter(function ($item) {
+                    return $item->status !== 'cancelled';
+                })->count();
+
+                return [
+                    'id' => $order->id,
+                    'order_number' => $order->order_number,
+                    'table_number' => $order->table ? $order->table->table_number : 'N/A',
+                    'order_type' => $order->order_type,
+                    'pickme_ref_number' => $order->pickme_ref_number,
+                    'total_amount' => $order->total_amount,
+                    // Format: Dec 08, 04:15 AM (using local timezone)
+                    'completed_at' => $order->completed_at ? $order->completed_at->format('M d, h:i A') : 'N/A',
+                    'items_count' => $activeItemsCount,
+                    'payment_method' => $order->payment ? $order->payment->payment_method : 'N/A',
+                ];
+            });
+
+        return response()->json([
+            'success' => true,
+            'orders' => $closedOrders
+        ]);
+    }
+
+    /**
+     * Get order details for editing
+     */
+    public function getOrder($orderId)
+    {
+        $order = Order::with([
+            'orderItems' => function ($query) {
+                $query->where('status', '!=', 'deleted')
+                    ->orderBy('id', 'asc')  // Ensure consistent ordering
+                    ->with(['item', 'modifiers.modifier']);
+                // NO LIMIT - fetch ALL items
+            },
+            'table',
+            'waiter',
+            'payment'
+        ])->findOrFail($orderId);
+
+        // Transform orderItems to items format expected by frontend
+        // Only include active items (not cancelled or deleted)
+        $items = $order->orderItems
+            ->filter(function ($orderItem) {
+                return !in_array($orderItem->status, ['cancelled', 'deleted']);
+            })
+            ->map(function ($orderItem) {
+                $modifiers = $orderItem->modifiers->map(function ($mod) {
+                    return [
+                        'id' => $mod->id,
+                        'modifier_id' => $mod->modifier_id,
+                        'name' => $mod->modifier->name ?? 'Modifier',
+                        'price_adjustment' => $mod->price_adjustment,
+                    ];
+                })->toArray();
+
+                return [
+                    'id' => $orderItem->id,
+                    'item_id' => $orderItem->item_id,
+                    'modifier_id' => $orderItem->item_modifier_id, // Include modifier_id for ID-based matching
+                    'name' => $orderItem->item_display_name ?? $orderItem->item->name ?? 'Unknown Item',
+                    'item_name' => $orderItem->item_display_name ?? $orderItem->item->name ?? 'Unknown Item',
+                    'item_code' => $orderItem->item->item_code ?? '',
+                    'price' => $orderItem->unit_price,
+                    'unit_price' => $orderItem->unit_price,
+                    'quantity' => $orderItem->quantity,
+                    'latest_added_quantity' => $orderItem->latest_added_quantity,
+                    'delivered_quantity' => $orderItem->delivered_quantity,
+                    'subtotal' => $orderItem->subtotal,
+                    'status' => $orderItem->status,
+                    'preparing_at' => $orderItem->preparing_at,
+                    'delivered_at' => $orderItem->delivered_at,
+                    'tax_flags' => [
+                        'vat_available' => (bool) ($orderItem->item->vat_available ?? false),
+                        'sscl_available' => (bool) ($orderItem->item->sscl_available ?? false),
+                    ],
+                    'preparing_to_delivered_seconds' => (
+                        $orderItem->status === 'delivered' && $orderItem->preparing_at && $orderItem->delivered_at
+                    ) ? $orderItem->delivered_at->diffInSeconds($orderItem->preparing_at) : null,
+                    'vat_available' => $orderItem->item ? $orderItem->item->vat_available : false,
+                    'sscl_available' => $orderItem->item ? $orderItem->item->sscl_available : false,
+                    'modifiers' => $modifiers,
+                    'item' => [
+                        'name' => $orderItem->item->name ?? 'Unknown Item',
+                        'item_code' => $orderItem->item->item_code ?? '',
+                        'vat_available' => (bool) ($orderItem->item->vat_available ?? false),
+                        'sscl_available' => (bool) ($orderItem->item->sscl_available ?? false),
+                    ]
+                ];
+            })->values(); // Reset array keys
+
+        return response()->json([
+            'success' => true,
+            'order' => [
+                'id' => $order->id,
+                'order_number' => $order->order_number,
+                'order_type' => $order->order_type,
+                'customer_name' => $order->customer_name,
+                'customer_vat_number' => $order->customer_vat_number,
+                'table_id' => $order->table_id,
+                'table_number' => $order->table ? $order->table->table_number : null,
+                'pickme_ref_number' => $order->pickme_ref_number,
+                'table' => $order->table ? [
+                    'id' => $order->table->id,
+                    'table_number' => $order->table->table_number
+                ] : null,
+                'waiter' => $order->waiter ? [
+                    'id' => $order->waiter->id,
+                    'name' => $order->waiter->name
+                ] : null,
+                'items' => $items,
+                'orderItems' => $items,
+                'order_items' => $items,
+                'total_amount' => $order->total_amount,
+                'subtotal' => $order->subtotal,
+                'status' => $order->status,
+                'payment' => $order->payment
+            ]
+        ]);
+    }
+
+    /**
+     * Place order (Create new order or update existing)
+     */
+    public function placeOrder(Request $request)
     {
         $validated = $request->validate([
-            'order_type' => 'required|in:dine-in,take-away,delivery',
+            'order_id' => 'nullable|exists:orders,id',
+            'order_type' => 'required|in:dine_in,takeaway,delivery,uber_eats,pickme',
             'table_id' => 'nullable|exists:tables,id',
             'customer_name' => 'nullable|string|max:255',
             'customer_phone' => 'nullable|string|max:20',
+            'pickme_ref_number' => 'nullable|string|max:100',
             'items' => 'required|array|min:1',
             'items.*.item_id' => 'required|exists:items,id',
-            'items.*.quantity' => 'required|integer|min:1',
+            'items.*.modifier_id' => 'nullable|exists:item_modifiers,id', // For ID-based stock deduction
+            'items.*.quantity' => 'required|integer|min:0', // Allow 0 for item removal
             'items.*.price' => 'required|numeric|min:0',
-            'items.*.modifiers' => 'nullable|array',
-            'items.*.special_instructions' => 'nullable|string',
-            'discount_type' => 'nullable|in:percentage,fixed',
-            'discount_value' => 'nullable|numeric|min:0',
-            'payment_method' => 'required|in:cash,card,upi,split',
-            'amount_paid' => 'required|numeric|min:0',
+            'items.*.name' => 'required|string',
+            'items.*.excluded_ingredients' => 'nullable|array',
+            'items.*.excluded_ingredients.*' => 'integer',
         ]);
 
         DB::beginTransaction();
         try {
-            // Create order
-            $order = Order::create([
-                'order_number' => 'ORD-' . time() . '-' . rand(1000, 9999),
-                'order_type' => $validated['order_type'],
-                'table_id' => $validated['table_id'] ?? null,
-                'customer_name' => $validated['customer_name'] ?? null,
-                'customer_phone' => $validated['customer_phone'] ?? null,
-                'waiter_id' => Auth::id(),
-                'status' => 'completed', // Direct order completion for POS
-                'subtotal' => 0,
-                'total_amount' => 0,
-            ]);
+            $isNewOrder = empty($validated['order_id']);
 
-            // Add items to order
-            $subtotal = 0;
-            foreach ($validated['items'] as $itemData) {
-                $item = Item::findOrFail($itemData['item_id']);
-                
-                $orderItem = OrderItem::create([
-                    'order_id' => $order->id,
-                    'item_id' => $item->id,
-                    'quantity' => $itemData['quantity'],
-                    'unit_price' => $itemData['price'],
-                    'subtotal' => $itemData['price'] * $itemData['quantity'],
-                    'special_instructions' => $itemData['special_instructions'] ?? null,
+            if ($isNewOrder) {
+                // Filter out items with quantity 0 for new orders
+                $validated['items'] = array_filter($validated['items'], function ($item) {
+                    return $item['quantity'] > 0;
+                });
+
+                // Create new order
+                $order = Order::create([
+                    'order_type' => $validated['order_type'],
+                    'table_id' => $validated['table_id'] ?? null,
+                    'customer_name' => $validated['customer_name'] ?? null,
+                    'customer_phone' => $validated['customer_phone'] ?? null,
+                    'pickme_ref_number' => $validated['pickme_ref_number'] ?? null,
+                    'waiter_id' => Auth::id(),
+                    'created_by' => Auth::id(),
+                    'status' => 'pending',
+                    'is_paid' => false,
+                    'placed_at' => now(),
+                    'subtotal' => 0,
+                    'total_amount' => 0,
                 ]);
 
-                // Add modifiers if any
-                if (!empty($itemData['modifiers'])) {
-                    foreach ($itemData['modifiers'] as $modifier) {
-                        $orderItem->modifiers()->create([
-                            'modifier_name' => $modifier['name'],
-                            'modifier_price' => $modifier['price'] ?? 0,
-                        ]);
-                        $orderItem->subtotal += $modifier['price'] ?? 0;
+                // Log order creation
+                OrderLog::logCreated($order, 'New order placed via POS');
+
+                // Reserve table if dine-in
+                if ($validated['table_id']) {
+                    $table = Table::find($validated['table_id']);
+                    $table->update([
+                        'status' => 'ordered',
+                        'current_order_id' => $order->id,
+                    ]);
+                }
+
+                // Process all items as new
+                $itemsToProcess = [];
+                foreach ($validated['items'] as $itemData) {
+                    $itemsToProcess[] = ['data' => $itemData, 'is_new' => true];
+                }
+            } else {
+                // Update existing order
+                $order = Order::findOrFail($validated['order_id']);
+
+                // Get existing ACTIVE order items (not deleted/cancelled)
+                $existingActiveItems = $order->orderItems
+                    ->filter(function ($item) {
+                        return !in_array($item->status, ['deleted', 'cancelled']);
+                    });
+
+                // Build lookup maps for matching
+                // Primary: groupBy item_id + modifier_id (handles duplicates safely, unlike keyBy)
+                $existingByKey = [];
+                foreach ($existingActiveItems as $item) {
+                    $key = $item->item_id . '_' . ($item->item_modifier_id ?? 'null');
+                    if (!isset($existingByKey[$key])) {
+                        $existingByKey[$key] = [];
                     }
-                    $orderItem->save();
+                    $existingByKey[$key][] = $item;
                 }
 
-                $subtotal += $orderItem->subtotal;
+                // Secondary lookup: by item_id + display_name (fallback when modifier_id is missing)
+                $existingByName = [];
+                foreach ($existingActiveItems as $item) {
+                    $nameKey = $item->item_id . '_' . ($item->item_display_name ?? '');
+                    if (!isset($existingByName[$nameKey])) {
+                        $existingByName[$nameKey] = [];
+                    }
+                    $existingByName[$nameKey][] = $item;
+                }
+
+                Log::info('Order update - existing items:', [
+                    'order_id' => $order->id,
+                    'existing_keys' => array_keys($existingByKey),
+                    'existing_name_keys' => array_keys($existingByName),
+                    'existing_item_count' => $existingActiveItems->count(),
+                    'existing_items_detail' => $existingActiveItems->map(function ($i) {
+                        return ['id' => $i->id, 'item_id' => $i->item_id, 'modifier_id' => $i->item_modifier_id, 'name' => $i->item_display_name, 'qty' => $i->quantity];
+                    })->values()->toArray(),
+                ]);
+
+                $itemsToProcess = [];
+                $matchedExistingIds = []; // Track which existing items were matched
+
+                // Helper: find best unmatched candidate from a group of items
+                $findBestCandidate = function ($candidates) use (&$matchedExistingIds) {
+                    if (empty($candidates))
+                        return null;
+                    foreach ($candidates as $candidate) {
+                        if (!in_array($candidate->id, $matchedExistingIds)) {
+                            return $candidate;
+                        }
+                    }
+                    return null; // All candidates already matched
+                };
+
+                // Process each item from the request
+                foreach ($validated['items'] as $itemData) {
+                    $modifierId = $itemData['modifier_id'] ?? null;
+                    $primaryKey = $itemData['item_id'] . '_' . ($modifierId ?? 'null');
+                    $nameKey = $itemData['item_id'] . '_' . ($itemData['name'] ?? '');
+
+                    Log::info('Processing request item:', [
+                        'item_id' => $itemData['item_id'],
+                        'modifier_id' => $modifierId,
+                        'name' => $itemData['name'] ?? '',
+                        'quantity' => $itemData['quantity'],
+                        'primary_key' => $primaryKey,
+                        'name_key' => $nameKey,
+                    ]);
+
+                    $matchedItem = null;
+
+                    // Pass 1: Try exact match by item_id + modifier_id
+                    if (isset($existingByKey[$primaryKey])) {
+                        $matchedItem = $findBestCandidate($existingByKey[$primaryKey]);
+                        if ($matchedItem) {
+                            Log::info('Matched by primary key (item_id+modifier_id)', ['key' => $primaryKey, 'matched_id' => $matchedItem->id]);
+                        }
+                    }
+
+                    // Pass 2: If no match and modifier_id is null, try matching by item_id + name
+                    // This handles the case where frontend loses modifier_id but the item hasn't changed
+                    if (!$matchedItem && $modifierId === null && isset($existingByName[$nameKey])) {
+                        $matchedItem = $findBestCandidate($existingByName[$nameKey]);
+                        if ($matchedItem) {
+                            // IMPORTANT: Inherit the modifier_id from the existing item
+                            $modifierId = $matchedItem->item_modifier_id;
+                            $itemData['modifier_id'] = $modifierId;
+                            Log::info('Matched by name fallback, inherited modifier_id', [
+                                'name_key' => $nameKey,
+                                'matched_id' => $matchedItem->id,
+                                'inherited_modifier_id' => $modifierId,
+                            ]);
+                        }
+                    }
+
+                    // Pass 3: If still no match, try matching by item_id + name regardless of modifier_id
+                    // This handles cases where modifier_id changed or was lost
+                    if (!$matchedItem) {
+                        foreach ($existingByName as $nKey => $candidates) {
+                            // Check if the item_id matches and name includes the request name
+                            if (strpos($nKey, $itemData['item_id'] . '_') === 0) {
+                                $matchedItem = $findBestCandidate($candidates);
+                                if ($matchedItem && $matchedItem->item_display_name === ($itemData['name'] ?? '')) {
+                                    // Inherit the modifier_id from the existing item
+                                    $modifierId = $matchedItem->item_modifier_id;
+                                    $itemData['modifier_id'] = $modifierId;
+                                    Log::info('Matched by broad name search, inherited modifier_id', [
+                                        'name_key' => $nKey,
+                                        'matched_id' => $matchedItem->id,
+                                        'inherited_modifier_id' => $modifierId,
+                                    ]);
+                                    break;
+                                } else {
+                                    $matchedItem = null; // Name didn't match, reset
+                                }
+                            }
+                        }
+                    }
+
+                    if ($matchedItem && !in_array($matchedItem->id, $matchedExistingIds)) {
+                        // Item exists in the order - track it
+                        $matchedExistingIds[] = $matchedItem->id;
+                        $requestedQty = $itemData['quantity'];
+                        $currentQty = $matchedItem->quantity;
+
+                        // Handle quantity = 0 or removal
+                        if ($requestedQty <= 0) {
+                            if (!in_array($matchedItem->status, ['pending', 'preparing'])) {
+                                $matchedItem->update([
+                                    'status' => 'cancelled',
+                                    'quantity' => 0,
+                                    'subtotal' => 0
+                                ]);
+                                // Mark all preparation logs as cancelled
+                                $this->syncPreparationLogStatus($matchedItem, 'cancelled');
+                            } else {
+                                $matchedItem->delete();
+                            }
+                            continue;
+                        }
+
+                        if ($requestedQty != $currentQty) {
+                            // Update the existing order item quantity
+                            $quantityUpdate = $requestedQty > $currentQty
+                                ? $matchedItem->quantityIncreaseTrackingAttributes($requestedQty)
+                                : $matchedItem->quantityDecreaseTrackingAttributes($requestedQty);
+
+                            $matchedItem->update(array_merge($quantityUpdate, [
+                                'quantity' => $requestedQty,
+                                'subtotal' => $itemData['price'] * $requestedQty
+                            ]));
+
+                            // If increased, send only the DIFFERENCE to KOT
+                            if ($requestedQty > $currentQty) {
+                                $itemsToProcess[] = [
+                                    'data' => array_merge($itemData, ['quantity' => $requestedQty - $currentQty]),
+                                    'is_new' => false,
+                                    'order_item_id' => $matchedItem->id
+                                ];
+                                Log::info('Quantity increased, sending difference to KOT', [
+                                    'item_id' => $matchedItem->id,
+                                    'old_qty' => $currentQty,
+                                    'new_qty' => $requestedQty,
+                                    'kot_qty' => $requestedQty - $currentQty,
+                                ]);
+                            }
+                            // If decreased, update but don't send to KOT
+                        }
+                        // If quantity is the same, do nothing (item unchanged, no KOT needed)
+                    } else {
+                        // Completely new item - will create new order_item and send to KOT
+                        $itemsToProcess[] = ['data' => $itemData, 'is_new' => true];
+                        Log::info('New item to add', [
+                            'item_id' => $itemData['item_id'],
+                            'modifier_id' => $modifierId,
+                            'name' => $itemData['name'] ?? '',
+                            'quantity' => $itemData['quantity'],
+                        ]);
+                    }
+                }
+
+                // Handle items that were in the existing order but NOT in the current request
+                // These items have been removed by the user
+                foreach ($existingActiveItems as $existingItem) {
+                    if (!in_array($existingItem->id, $matchedExistingIds)) {
+                        Log::info('Item removed from order', [
+                            'item_id' => $existingItem->item_id,
+                            'modifier_id' => $existingItem->item_modifier_id,
+                            'name' => $existingItem->item_display_name,
+                            'status' => $existingItem->status,
+                        ]);
+                        if (!in_array($existingItem->status, ['pending', 'preparing'])) {
+                            $existingItem->update([
+                                'status' => 'cancelled',
+                                'quantity' => 0,
+                                'subtotal' => 0
+                            ]);
+                            // Mark all preparation logs as cancelled
+                            $this->syncPreparationLogStatus($existingItem, 'cancelled');
+                        } else {
+                            $existingItem->update(['status' => 'deleted']);
+                            // Mark all preparation logs as deleted
+                            $this->syncPreparationLogStatus($existingItem, 'deleted');
+                        }
+                    }
+                }
+
+                // Update placed_at timestamp
+                $order->update(['placed_at' => now()]);
             }
 
-            // Apply discount
-            $discountAmount = 0;
-            if (!empty($validated['discount_type']) && !empty($validated['discount_value'])) {
-                if ($validated['discount_type'] === 'percentage') {
-                    $discountAmount = ($subtotal * $validated['discount_value']) / 100;
+            // Process items and generate KOT - ONLY for new/changed items
+            $kotItems = [];
+
+            foreach ($itemsToProcess as $processItem) {
+                $itemData = $processItem['data'];
+                $item = Item::with('category')->findOrFail($itemData['item_id']);
+
+                if ($processItem['is_new']) {
+                    // Create new order item with modifier_id for ID-based stock deduction
+                    $orderItem = OrderItem::create([
+                        'order_id' => $order->id,
+                        'item_id' => $item->id,
+                        'item_modifier_id' => $itemData['modifier_id'] ?? null, // Store modifier ID for stock deduction
+                        'item_display_name' => $itemData['name'] ?? $item->name,
+                        'quantity' => $itemData['quantity'],
+                        'latest_added_quantity' => $itemData['quantity'],
+                        'delivered_quantity' => 0,
+                        'unit_price' => $itemData['price'],
+                        'subtotal' => $itemData['price'] * $itemData['quantity'],
+                        'status' => 'preparing',
+                        'preparing_at' => now(),
+                        'excluded_ingredients' => !empty($itemData['excluded_ingredients']) ? $itemData['excluded_ingredients'] : null,
+                    ]);
+
+                    // Create individual preparation log entries for each unit
+                    $this->createPreparationLogs($orderItem, $itemData['quantity']);
                 } else {
-                    $discountAmount = $validated['discount_value'];
+                    // Updated item - use existing order_item
+                    $orderItem = OrderItem::find($processItem['order_item_id']);
+
+                    // If quantity increased, create additional preparation logs for the added units
+                    if ($orderItem) {
+                        $addedQty = $itemData['quantity']; // This is already the difference (requestedQty - currentQty) for KOT
+                        if ($addedQty > 0) {
+                            $this->createPreparationLogs($orderItem, $addedQty);
+                        }
+                    }
                 }
+
+                // Add to KOT - ONLY new/changed items go here
+                $kotItems[] = [
+                    'item' => $item,
+                    'order_item' => $orderItem,
+                    'quantity' => $itemData['quantity'], // Quantity for KOT (difference for updates, full for new)
+                ];
             }
 
-            // Calculate totals
-            $taxRate = 0; // You can configure this
-            $taxAmount = 0; // ($subtotal - $discountAmount) * ($taxRate / 100);
-            $totalAmount = $subtotal - $discountAmount + $taxAmount;
+            // Recalculate order totals from all active order items (with full tax breakdown)
+            $order->refresh();
+            $activeOrderItems = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->with('item')
+                ->get();
 
-            // Update order totals
+            $taxTotals = $this->taxService->calculateOrderTax($activeOrderItems);
+
             $order->update([
-                'subtotal' => $subtotal,
-                'discount_type' => $validated['discount_type'] ?? null,
-                'discount_value' => $validated['discount_value'] ?? 0,
-                'discount_amount' => $discountAmount,
-                'tax_amount' => $taxAmount,
-                'service_charge' => 0,
-                'total_amount' => $totalAmount,
+                'subtotal'     => $taxTotals['subtotal'],
+                'sscl_amount'  => $taxTotals['sscl_amount'],
+                'vat_amount'   => $taxTotals['vat_amount'],
+                'tax_amount'   => $taxTotals['tax_amount'],
+                'total_amount' => $taxTotals['total_amount'],
             ]);
 
-            // Process payment
-            $payment = Payment::create([
-                'order_id' => $order->id,
-                'amount' => $totalAmount,
-                'payment_method' => $validated['payment_method'],
-                'amount_paid' => $validated['amount_paid'],
-                'change_amount' => max(0, $validated['amount_paid'] - $totalAmount),
-                'cashier_id' => Auth::id(),
-                'status' => 'completed',
-                'transaction_id' => 'POS-' . time() . '-' . rand(1000, 9999),
-            ]);
+            // Generate KOT/BOT for new/updated items ONLY
+            $kotNumbers = ['kot_number' => null, 'bot_number' => null];
+            if (!empty($kotItems)) {
+                Log::info('Generating KOT/BOT for ' . count($kotItems) . ' new/changed items', [
+                    'items' => array_map(function ($ki) {
+                        return [
+                            'item_id' => $ki['item']->id,
+                            'name' => $ki['order_item']->item_display_name ?? $ki['item']->name,
+                            'quantity' => $ki['quantity'],
+                        ];
+                    }, $kotItems),
+                ]);
+                $kotNumbers = $this->generateKOT($order, $kotItems);
+            } else {
+                Log::info('No new/changed items - skipping KOT/BOT generation');
+            }
+
+            // Prepare items payload for frontend printing (non-cancelled, non-deleted)
+            $printItemsRaw = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->with(['item', 'modifiers.modifier'])
+                ->get();
+
+            $printItems = $printItemsRaw->map(function ($orderItem) {
+                $modifiers = $orderItem->modifiers->map(function ($mod) {
+                    return [
+                        'id' => $mod->id,
+                        'modifier_id' => $mod->modifier_id,
+                        'name' => $mod->modifier->name ?? 'Modifier',
+                        'price_adjustment' => $mod->price_adjustment,
+                    ];
+                })->toArray();
+
+                return [
+                    'id' => $orderItem->id,
+                    'item_id' => $orderItem->item_id,
+                    'name' => $orderItem->item_display_name ?? $orderItem->item->name ?? 'Unknown Item',
+                    'item_name' => $orderItem->item_display_name ?? $orderItem->item->name ?? 'Unknown Item',
+                    'item_code' => $orderItem->item->item_code ?? '',
+                    'tax_flags' => [
+                        'vat_available' => (bool) ($orderItem->item->vat_available ?? false),
+                        'sscl_available' => (bool) ($orderItem->item->sscl_available ?? false),
+                    ],
+                    'vat_available' => $orderItem->item->vat_available ?? false,
+                    'sscl_available' => $orderItem->item->sscl_available ?? false,
+                    'unit_price' => $orderItem->unit_price,
+                    'price' => $orderItem->unit_price,
+                    'quantity' => $orderItem->quantity,
+                    'latest_added_quantity' => $orderItem->latest_added_quantity,
+                    'delivered_quantity' => $orderItem->delivered_quantity,
+                    'subtotal' => $orderItem->subtotal,
+                    'status' => $orderItem->status,
+                    'preparing_at' => $orderItem->preparing_at,
+                    'delivered_at' => $orderItem->delivered_at,
+                    'preparing_to_delivered_seconds' => (
+                        $orderItem->status === 'delivered' && $orderItem->preparing_at && $orderItem->delivered_at
+                    ) ? $orderItem->delivered_at->diffInSeconds($orderItem->preparing_at) : null,
+                    'modifiers' => $modifiers,
+                    'item' => [
+                        'name' => $orderItem->item->name ?? 'Unknown Item',
+                        'item_code' => $orderItem->item->item_code ?? '',
+                        'vat_available' => (bool) ($orderItem->item->vat_available ?? false),
+                        'sscl_available' => (bool) ($orderItem->item->sscl_available ?? false),
+                    ],
+                ];
+            })->values();
+
+            // Attach relations/attributes so JS can read order.orderItems / order_items
+            $order = $order->load(['table', 'waiter', 'payment']);
+            $order->setRelation('orderItems', $printItemsRaw);
+            $order->setAttribute('order_items', $printItems);
 
             DB::commit();
 
             return response()->json([
                 'success' => true,
-                'message' => 'Order processed successfully',
-                'order' => $order->load(['items.item', 'payment']),
-                'payment' => $payment,
+                'message' => $isNewOrder ? 'Order placed successfully' : 'Order updated successfully',
+                'order' => $order,
+                'order_items' => $printItems,
+                'orderItems' => $printItems,
+                'items' => $printItems,
+                'order_number' => $order->order_number,
+                'order_type' => $order->order_type,
+                'table_number' => $order->table ? $order->table->table_number : null,
+                'pickme_ref_number' => $order->pickme_ref_number,
+                'kot_number' => $kotNumbers['kot_number'],
+                'kot_sub_number' => $kotNumbers['kot_sub_number'] ?? null,
+                'kot_display_number' => $kotNumbers['kot_display_number'] ?? $kotNumbers['kot_number'],
+                'bot_number' => $kotNumbers['bot_number'],
+                'bot_sub_number' => $kotNumbers['bot_sub_number'] ?? null,
+                'bot_display_number' => $kotNumbers['bot_display_number'] ?? $kotNumbers['bot_number'],
+                'kot_items' => $kotNumbers['kot_items'] ?? [],
+                'bot_items' => $kotNumbers['bot_items'] ?? [],
+                'is_new' => $isNewOrder,
             ]);
-
         } catch (\Exception $e) {
             DB::rollBack();
             return response()->json([
                 'success' => false,
-                'message' => 'Error processing order: ' . $e->getMessage()
+                'message' => 'Error placing order: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Mark a single order item as delivered.
+     */
+    public function markOrderItemDelivered(Request $request, OrderItem $orderItem)
+    {
+        $validated = $request->validate([
+            'delivered_amount' => 'nullable|integer|min:1',
+        ]);
+
+        $orderItem->loadMissing('order');
+
+        if ($orderItem->order && ($orderItem->order->is_paid || $orderItem->order->status === 'completed')) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot update items for a closed order.'
+            ], 422);
+        }
+
+        if (in_array($orderItem->status, ['cancelled', 'deleted'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This item cannot be delivered.'
+            ], 422);
+        }
+
+        if ($orderItem->status === 'delivered' && (int) $orderItem->delivered_quantity === (int) $orderItem->quantity) {
+            $durationSeconds = null;
+            if ($orderItem->preparing_at && $orderItem->delivered_at) {
+                $durationSeconds = $orderItem->delivered_at->diffInSeconds($orderItem->preparing_at);
+            }
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Item already delivered.',
+                'order_item' => [
+                    'id' => $orderItem->id,
+                    'status' => 'delivered',
+                    'preparing_at' => $orderItem->preparing_at,
+                    'delivered_at' => $orderItem->delivered_at,
+                    'last_delivered_at' => $orderItem->last_delivered_at,
+                    'latest_added_quantity' => $orderItem->latest_added_quantity,
+                    'delivered_quantity' => $orderItem->delivered_quantity,
+                    'preparing_to_delivered_seconds' => $durationSeconds,
+                ],
+            ]);
+        }
+
+        $deliveredAmount = $validated['delivered_amount'] ?? max((int) $orderItem->quantity - (int) $orderItem->delivered_quantity, 0);
+        $trackingUpdate = $orderItem->deliveryTrackingAttributes($deliveredAmount);
+
+        $nextDeliveredQuantity = (int) ($trackingUpdate['delivered_quantity'] ?? $orderItem->delivered_quantity);
+        $nextQuantity = (int) $orderItem->quantity;
+        $isFullyDelivered = $nextQuantity > 0 && $nextDeliveredQuantity === $nextQuantity;
+
+        $trackingUpdate['status'] = $isFullyDelivered ? 'delivered' : 'preparing';
+
+        $orderItem->update([
+            'status' => $trackingUpdate['status'],
+        ] + $trackingUpdate);
+        $orderItem->refresh();
+
+        // FIFO delivery: mark oldest undelivered preparation logs as delivered
+        $this->deliverPreparationLogs($orderItem, $deliveredAmount);
+
+        $durationSeconds = null;
+        if ($orderItem->preparing_at && $orderItem->delivered_at) {
+            $durationSeconds = $orderItem->delivered_at->diffInSeconds($orderItem->preparing_at);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => $orderItem->status === 'delivered'
+                ? 'Item marked as delivered.'
+                : 'Item remains in preparing until fully delivered.',
+            'order_item' => [
+                'id' => $orderItem->id,
+                'status' => $orderItem->status,
+                'preparing_at' => $orderItem->preparing_at,
+                'delivered_at' => $orderItem->delivered_at,
+                'latest_added_quantity' => $orderItem->latest_added_quantity,
+                'delivered_quantity' => $orderItem->delivered_quantity,
+                'preparing_to_delivered_seconds' => $durationSeconds,
+            ],
+        ]);
+    }
+
+    /**
+     * Change a single order item back to preparing (supervisor authorized).
+     */
+    public function markOrderItemPreparing(Request $request, OrderItem $orderItem)
+    {
+        $validated = $request->validate([
+            'supervisor_pin' => 'required|string|size:4',
+        ]);
+
+        $supervisors = \App\Models\User::whereHas('roles', function ($query) {
+            $query->where('name', 'supervisor');
+        })
+            ->where('is_active', true)
+            ->get();
+
+        $supervisor = null;
+        foreach ($supervisors as $sup) {
+            if ($sup->dynamic_pin === $validated['supervisor_pin']) {
+                $supervisor = $sup;
+                break;
+            }
+        }
+
+        if (!$supervisor) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Invalid supervisor PIN'
+            ], 401);
+        }
+
+        $orderItem->loadMissing('order');
+
+        if ($orderItem->order && ($orderItem->order->is_paid || $orderItem->order->status === 'completed')) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot update items for a closed order.'
+            ], 422);
+        }
+
+        if (in_array($orderItem->status, ['cancelled', 'deleted'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This item cannot be changed to preparing.'
+            ], 422);
+        }
+
+        if ($orderItem->status === 'preparing') {
+            return response()->json([
+                'success' => true,
+                'message' => 'Item is already preparing.',
+                'order_item' => [
+                    'id' => $orderItem->id,
+                    'status' => 'preparing',
+                    'preparing_at' => $orderItem->preparing_at,
+                    'delivered_at' => $orderItem->delivered_at,
+                    'last_delivered_at' => $orderItem->last_delivered_at,
+                    'latest_added_quantity' => $orderItem->latest_added_quantity,
+                    'delivered_quantity' => $orderItem->delivered_quantity,
+                    'preparing_to_delivered_seconds' => null,
+                ],
+            ]);
+        }
+
+        $orderItem->update([
+            'status' => 'preparing',
+            'preparing_at' => now(),
+        ]);
+        $orderItem->refresh();
+
+        // Create new preparation logs for the quantity being re-prepared
+        $undeliveredCount = (int) $orderItem->quantity - (int) $orderItem->delivered_quantity;
+        if ($undeliveredCount > 0) {
+            // Mark any existing undelivered logs as cancelled (they are being re-prepared)
+            OrderItemPreparationLog::where('order_item_id', $orderItem->id)
+                ->undelivered()
+                ->reportable()
+                ->update(['item_status' => 'cancelled']);
+
+            // Create fresh preparation logs for the undelivered quantity
+            $this->createPreparationLogs($orderItem, $undeliveredCount);
+        }
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Item moved back to preparing by supervisor ' . $supervisor->name . '.',
+            'order_item' => [
+                'id' => $orderItem->id,
+                'status' => 'preparing',
+                'preparing_at' => $orderItem->preparing_at,
+                'delivered_at' => $orderItem->delivered_at,
+                'latest_added_quantity' => $orderItem->latest_added_quantity,
+                'delivered_quantity' => $orderItem->delivered_quantity,
+                'preparing_to_delivered_seconds' => null,
+            ],
+        ]);
+    }
+
+    /**
+     * Alias API for normal inline delivery updates.
+     */
+    public function updateOrderItemDelivery(Request $request)
+    {
+        $validated = $request->validate([
+            'order_item_id' => 'required|exists:order_items,id',
+            'delivered_amount' => 'nullable|integer|min:1',
+        ]);
+
+        $orderItem = OrderItem::findOrFail($validated['order_item_id']);
+
+        return $this->markOrderItemDelivered($request, $orderItem);
+    }
+
+    /**
+     * Supervisor-authorized correction for delivered quantity and delivered item reopening.
+     */
+    public function supervisorOverrideOrderItemDelivery(Request $request)
+    {
+        $validated = $request->validate([
+            'order_item_id' => 'required|exists:order_items,id',
+            'supervisor_pin' => 'required|string|size:4',
+            'delivered_quantity' => 'required|integer|min:0',
+            'action_type' => 'nullable|string|max:64',
+        ]);
+
+        $supervisor = $this->resolveSupervisorByPin($validated['supervisor_pin']);
+        if (!$supervisor) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Invalid supervisor PIN'
+            ], 401);
+        }
+
+        $orderItem = OrderItem::with('order')->findOrFail($validated['order_item_id']);
+
+        if ($orderItem->order && ($orderItem->order->is_paid || $orderItem->order->status === 'completed')) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot update items for a closed order.'
+            ], 422);
+        }
+
+        if (in_array($orderItem->status, ['cancelled', 'deleted'])) {
+            return response()->json([
+                'success' => false,
+                'message' => 'This item cannot be updated.'
+            ], 422);
+        }
+
+        $oldDeliveredQuantity = (int) $orderItem->delivered_quantity;
+        $newDeliveredQuantity = min((int) $validated['delivered_quantity'], (int) $orderItem->quantity);
+
+        $newStatus = $newDeliveredQuantity === (int) $orderItem->quantity ? 'delivered' : 'preparing';
+        $newDeliveredAt = $orderItem->delivered_at ?? ($newDeliveredQuantity > 0 ? now() : null);
+
+        $orderItem->update([
+            'delivered_quantity' => $newDeliveredQuantity,
+            'status' => $newStatus,
+            'delivered_at' => $newDeliveredAt,
+        ]);
+        $orderItem->refresh();
+
+        OrderItemDeliveryAudit::create([
+            'order_item_id' => $orderItem->id,
+            'order_id' => $orderItem->order_id,
+            'action_type' => $validated['action_type'] ?: 'supervisor_override',
+            'old_value' => $oldDeliveredQuantity,
+            'new_value' => $newDeliveredQuantity,
+            'supervisor_id' => $supervisor->id,
+            'meta' => [
+                'status_before' => $oldDeliveredQuantity >= (int) $orderItem->quantity ? 'delivered' : 'preparing',
+                'status_after' => $orderItem->status,
+            ],
+        ]);
+
+        // Sync preparation logs with supervisor override
+        $this->syncPreparationLogsForSupervisorOverride($orderItem, $oldDeliveredQuantity, $newDeliveredQuantity);
+
+        return response()->json([
+            'success' => true,
+            'message' => 'Supervisor override applied.',
+            'order_item' => $this->orderItemDeliveryPayload($orderItem),
+        ]);
+    }
+
+    private function resolveSupervisorByPin(string $pin): ?\App\Models\User
+    {
+        $supervisors = \App\Models\User::whereHas('roles', function ($query) {
+            $query->where('name', 'supervisor');
+        })
+            ->where('is_active', true)
+            ->get();
+
+        foreach ($supervisors as $supervisor) {
+            if ($supervisor->dynamic_pin === $pin) {
+                return $supervisor;
+            }
+        }
+
+        return null;
+    }
+
+    private function orderItemDeliveryPayload(OrderItem $orderItem): array
+    {
+        $durationSeconds = null;
+        if ($orderItem->preparing_at && $orderItem->delivered_at) {
+            $durationSeconds = $orderItem->delivered_at->diffInSeconds($orderItem->preparing_at);
+        }
+
+        return [
+            'id' => $orderItem->id,
+            'status' => $orderItem->status,
+            'preparing_at' => $orderItem->preparing_at,
+            'delivered_at' => $orderItem->delivered_at,
+            'last_delivered_at' => $orderItem->last_delivered_at,
+            'latest_added_quantity' => $orderItem->latest_added_quantity,
+            'delivered_quantity' => $orderItem->delivered_quantity,
+            'preparing_to_delivered_seconds' => $durationSeconds,
+        ];
+    }
+
+    /**
+     * Create individual preparation log entries for each unit of quantity.
+     */
+    private function createPreparationLogs(OrderItem $orderItem, int $quantity): void
+    {
+        $now = now();
+        for ($i = 0; $i < $quantity; $i++) {
+            OrderItemPreparationLog::create([
+                'order_id' => $orderItem->order_id,
+                'order_item_id' => $orderItem->id,
+                'item_id' => $orderItem->item_id,
+                'item_modifier_id' => $orderItem->item_modifier_id,
+                'item_display_name' => $orderItem->item_display_name ?? 'Unknown',
+                'quantity' => 1,
+                'item_status' => 'preparing',
+                'prepared_at' => $now,
+            ]);
+        }
+    }
+
+    /**
+     * FIFO delivery: mark the oldest undelivered preparation logs as delivered.
+     */
+    private function deliverPreparationLogs(OrderItem $orderItem, int $deliveredAmount): void
+    {
+        $now = now();
+        $logs = OrderItemPreparationLog::where('order_item_id', $orderItem->id)
+            ->undelivered()
+            ->reportable()
+            ->orderBy('prepared_at', 'asc')
+            ->orderBy('id', 'asc')
+            ->limit($deliveredAmount)
+            ->get();
+
+        foreach ($logs as $log) {
+            $log->update([
+                'delivered_at' => $now,
+                'preparation_minutes' => $log->prepared_at->diffInMinutes($now),
+                'item_status' => 'delivered',
+            ]);
+        }
+    }
+
+    /**
+     * Sync preparation log statuses when an order item is cancelled or deleted.
+     */
+    private function syncPreparationLogStatus(OrderItem $orderItem, string $status): void
+    {
+        OrderItemPreparationLog::where('order_item_id', $orderItem->id)
+            ->whereNotIn('item_status', ['cancelled', 'deleted'])
+            ->update(['item_status' => $status]);
+    }
+
+    /**
+     * Sync preparation logs when supervisor overrides delivered quantity.
+     */
+    private function syncPreparationLogsForSupervisorOverride(
+        OrderItem $orderItem,
+        int $oldDeliveredQuantity,
+        int $newDeliveredQuantity
+    ): void {
+        if ($newDeliveredQuantity > $oldDeliveredQuantity) {
+            // Supervisor increased delivered quantity — deliver additional logs (FIFO)
+            $additionalDelivered = $newDeliveredQuantity - $oldDeliveredQuantity;
+            $this->deliverPreparationLogs($orderItem, $additionalDelivered);
+        } elseif ($newDeliveredQuantity < $oldDeliveredQuantity) {
+            // Supervisor decreased delivered quantity — reopen the most recently delivered logs
+            $reopenCount = $oldDeliveredQuantity - $newDeliveredQuantity;
+            $logs = OrderItemPreparationLog::where('order_item_id', $orderItem->id)
+                ->where('item_status', 'delivered')
+                ->whereNotNull('delivered_at')
+                ->orderBy('delivered_at', 'desc')
+                ->orderBy('id', 'desc')
+                ->limit($reopenCount)
+                ->get();
+
+            foreach ($logs as $log) {
+                $log->update([
+                    'delivered_at' => null,
+                    'preparation_minutes' => null,
+                    'item_status' => 'preparing',
+                ]);
+            }
+        }
+    }
+
+    /**
+     * Generate KOT/BOT based on item categories
+     * Handles sub-numbering for orders that have items added later:
+     * - First KOT/BOT for an order: sub_number = 0 (primary)
+     * - Subsequent KOT/BOT additions: sub_number = 1, 2, 3... (secondary)
+     */
+    private function generateKOT($order, $kotItems)
+    {
+        // Group items by category - BEVERAGES and DESSERTS go to BOT, everything else to KOT
+        $kitchenItems = [];
+        $barItems = [];
+
+        foreach ($kotItems as $kotItem) {
+            $item = $kotItem['item'];
+
+            // Load category if not already loaded
+            if (!$item->relationLoaded('category')) {
+                $item->load('category');
+            }
+
+            // Check by category_id or category slug - Only BEVERAGES (ID 21) go to BOT
+            // Desserts and all other categories go to KOT (Kitchen Order Ticket)
+            $isBarItem = false;
+
+            if ($item->category_id === 21) {
+                // Only Beverages (ID 21) go to BOT
+                $isBarItem = true;
+            } elseif ($item->category) {
+                // Fallback: check by slug/name for flexibility
+                $categorySlug = strtolower($item->category->slug);
+                $categoryName = strtoupper($item->category->name);
+                $isBarItem = (
+                    $categorySlug === 'beverages' || $categoryName === 'BEVERAGES'
+                );
+            }
+
+            if ($isBarItem) {
+                $barItems[] = $kotItem;
+            } else {
+                $kitchenItems[] = $kotItem;
+            }
+        }
+
+        // Create KOT for kitchen
+        $kotNumber = null;
+        $kotSubNumber = null;
+        $kotDisplayNumber = null;
+        if (!empty($kitchenItems)) {
+            // Get the next sub-number for this order's kitchen station KOTs
+            $subNumber = Kot::getNextSubNumber($order->id, 1); // 1 = kitchen station
+
+            $kot = Kot::create([
+                'order_id' => $order->id,
+                'table_id' => $order->table_id,
+                'waiter_id' => $order->waiter_id,
+                'kitchen_station_id' => 1, // Default kitchen station
+                'sub_number' => $subNumber,
+                'status' => 'pending',
+                'printed_at' => now(),
+                'print_count' => 1,
+            ]);
+
+            $kotNumber = $kot->kot_number;
+            $kotSubNumber = $subNumber;
+            $kotDisplayNumber = $kot->getDisplayNumber();
+
+            foreach ($kitchenItems as $kotItem) {
+                KotItem::create([
+                    'kot_id' => $kot->id,
+                    'order_item_id' => $kotItem['order_item']->id,
+                    'item_name' => $kotItem['order_item']->item_display_name ?? $kotItem['item']->name,
+                    'quantity' => $kotItem['quantity'],
+                    'special_instructions' => $kotItem['order_item']->special_instructions,
+                    'modifiers' => $kotItem['order_item']->modifiers ?? null,
+                    'status' => 'pending',
+                ]);
+            }
+        }
+
+        // Create BOT for bar (using same KOT structure)
+        $botNumber = null;
+        $botSubNumber = null;
+        $botDisplayNumber = null;
+        if (!empty($barItems)) {
+            // Get the next sub-number for this order's bar station BOTs
+            $subNumber = Kot::getNextSubNumber($order->id, 2); // 2 = bar station
+
+            $bot = Kot::create([
+                'order_id' => $order->id,
+                'table_id' => $order->table_id,
+                'waiter_id' => $order->waiter_id,
+                'kitchen_station_id' => 2, // Bar station
+                'sub_number' => $subNumber,
+                'status' => 'pending',
+                'printed_at' => now(),
+                'print_count' => 1,
+            ]);
+
+            $botNumber = $bot->kot_number;
+            $botSubNumber = $subNumber;
+            $botDisplayNumber = $bot->getDisplayNumber();
+
+            foreach ($barItems as $botItem) {
+                KotItem::create([
+                    'kot_id' => $bot->id,
+                    'order_item_id' => $botItem['order_item']->id,
+                    'item_name' => $botItem['order_item']->item_display_name ?? $botItem['item']->name,
+                    'quantity' => $botItem['quantity'],
+                    'special_instructions' => $botItem['order_item']->special_instructions,
+                    'modifiers' => $botItem['order_item']->modifiers ?? null,
+                    'status' => 'pending',
+                ]);
+            }
+        }
+
+        // Update order print count
+        $order->increment('kot_print_count');
+        $order->last_kot_printed_at = now();
+        $order->save();
+
+        // Prepare items data for frontend printing
+        $kotItemsData = array_map(function ($kotItem) {
+            return [
+                'name' => $kotItem['order_item']->item_display_name ?? $kotItem['item']->name,
+                'quantity' => $kotItem['quantity'],
+                'item_id' => $kotItem['item']->id
+            ];
+        }, $kitchenItems);
+
+        $botItemsData = array_map(function ($botItem) {
+            return [
+                'name' => $botItem['order_item']->item_display_name ?? $botItem['item']->name,
+                'quantity' => $botItem['quantity'],
+                'item_id' => $botItem['item']->id
+            ];
+        }, $barItems);
+
+        return [
+            'kot_number' => $kotNumber,
+            'kot_sub_number' => $kotSubNumber,
+            'kot_display_number' => $kotDisplayNumber,
+            'bot_number' => $botNumber,
+            'bot_sub_number' => $botSubNumber,
+            'bot_display_number' => $botDisplayNumber,
+            'kot_items' => $kotItemsData,
+            'bot_items' => $botItemsData
+        ];
+    }
+
+    /**
+     * Process payment for an order
+     */
+    public function processPayment(Request $request)
+    {
+        $validated = $request->validate([
+            'order_id' => 'required|exists:orders,id',
+            'payment_method' => 'required|in:cash,card,credit,card_cash,mixed',
+            'amount_paid' => 'nullable|numeric|min:0',
+            'cash_amount' => 'nullable|numeric|min:0',
+            'card_amount' => 'nullable|numeric|min:0',
+        ]);
+
+        DB::beginTransaction();
+        try {
+            $order = Order::findOrFail($validated['order_id']);
+
+            // Check if order is already paid
+            if ($order->is_paid) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'This order has already been paid'
+                ], 400);
+            }
+
+            $hasUndeliveredItems = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->where('status', '!=', 'delivered')
+                ->exists();
+
+            if ($hasUndeliveredItems) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot close order until all items are delivered'
+                ], 400);
+            }
+
+            $totalAmount = $order->total_amount;
+
+            // Validate payment amounts based on method
+            if ($validated['payment_method'] === 'card_cash' || $validated['payment_method'] === 'mixed') {
+                $cashAmt = $validated['cash_amount'] ?? 0;
+                $cardAmt = $validated['card_amount'] ?? 0;
+                if (($cashAmt + $cardAmt) < $totalAmount) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Insufficient payment amount'
+                    ], 400);
+                }
+            } elseif ($validated['payment_method'] === 'cash') {
+                if (($validated['cash_amount'] ?? $validated['amount_paid'] ?? 0) < $totalAmount) {
+                    return response()->json([
+                        'success' => false,
+                        'message' => 'Insufficient cash amount'
+                    ], 400);
+                }
+            }
+
+            // Map payment methods
+            $paymentMethodMap = [
+                'cash' => 'cash',
+                'card' => 'card',
+                'credit' => 'credit',
+                'card_cash' => 'mixed',
+                'mixed' => 'mixed'
+            ];
+
+            // Calculate specific payment amounts
+            $cashAmount = 0;
+            $cardAmount = 0;
+            $creditAmount = 0;
+            $changeAmount = 0;
+
+            switch ($validated['payment_method']) {
+                case 'cash':
+                    $cashAmount = $validated['cash_amount'] ?? $validated['amount_paid'] ?? 0;
+                    $changeAmount = max(0, $cashAmount - $totalAmount);
+                    break;
+                case 'card':
+                    $cardAmount = $validated['card_amount'] ?? $validated['amount_paid'] ?? $totalAmount;
+                    break;
+                case 'credit':
+                    $creditAmount = $totalAmount;
+                    break;
+                case 'card_cash':
+                case 'mixed':
+                    // For mixed payments: store full amounts given
+                    $cashAmount = $validated['cash_amount'] ?? 0;
+                    $cardAmount = $validated['card_amount'] ?? 0;
+
+                    // Card is applied first (exact, no change), cash pays the rest
+                    $remainingAfterCard = $totalAmount - $cardAmount;
+                    // Change only comes from excess cash (cash given minus what's needed after card)
+                    $changeAmount = max(0, $cashAmount - max(0, $remainingAfterCard));
+                    break;
+            }
+
+            // Generate unique payment number
+            $paymentNumber = 'PAY-' . date('Ymd') . '-' . str_pad($order->id, 5, '0', STR_PAD_LEFT);
+
+            // Create payment
+            $payment = Payment::create([
+                'order_id' => $order->id,
+                'payment_number' => $paymentNumber,
+                'total_amount' => $totalAmount,
+                'cash_amount' => $cashAmount,
+                'card_amount' => $cardAmount,
+                'credit_amount' => $creditAmount,
+                'change_amount' => $changeAmount,
+                'payment_method' => $paymentMethodMap[$validated['payment_method']],
+                'payment_status' => 'completed',
+                'processed_by' => Auth::id(),
+                'processed_at' => now(),
+            ]);
+
+            // Create payment splits for mixed payments
+            if (($validated['payment_method'] === 'card_cash' || $validated['payment_method'] === 'mixed') && ($cashAmount > 0 || $cardAmount > 0)) {
+                if ($cashAmount > 0) {
+                    \App\Models\PaymentSplit::create([
+                        'payment_id' => $payment->id,
+                        'payment_method' => 'cash',
+                        'amount' => $cashAmount,
+                    ]);
+                }
+                if ($cardAmount > 0) {
+                    \App\Models\PaymentSplit::create([
+                        'payment_id' => $payment->id,
+                        'payment_method' => 'card',
+                        'amount' => $cardAmount,
+                    ]);
+                }
+            }
+
+            // Update order
+            $oldStatus = $order->status;
+            $order->update([
+                'status' => 'completed',
+                'is_paid' => true,
+                'completed_at' => now(),
+            ]);
+
+            // Log payment and status change
+            OrderLog::logPaymentAdded($order, [
+                'payment_id' => $payment->id,
+                'payment_number' => $payment->payment_number,
+                'payment_method' => $payment->payment_method,
+                'total_amount' => $payment->total_amount,
+                'cash_amount' => $payment->cash_amount,
+                'card_amount' => $payment->card_amount,
+                'change_amount' => $payment->change_amount,
+            ], 'Payment processed');
+
+            // Log status change
+            OrderLog::logStatusChanged($order, $oldStatus, 'completed', 'Order completed after payment');
+
+            // Free up table if dine-in
+            if ($order->table_id) {
+                $table = Table::find($order->table_id);
+                if ($table) {
+                    $table->update([
+                        'status' => 'available',
+                        'current_order_id' => null,
+                    ]);
+                }
+            }
+
+            // Deduct stock for Finished Goods items from CashierSubStock (FG Stock)
+            // Stock is deducted even if not present (creates stock entry with negative quantity)
+            $orderItemsForStock = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->with(['item.category'])
+                ->get();
+
+            foreach ($orderItemsForStock as $orderItem) {
+                if (!$orderItem->item)
+                    continue;
+
+                // Check if item should be deducted as Finished Good
+                // BOTH conditions must be true: is_finished_goods AND is_stock_count
+                // No fallback by category - only explicit checkbox settings matter
+                $isFinishedGoodsItem = $orderItem->item->is_finished_goods && $orderItem->item->is_stock_count;
+
+                // Deduct stock ONLY if item has BOTH Finished Goods AND Stock Count checked
+                if ($isFinishedGoodsItem && $orderItem->quantity > 0) {
+                    // Use ID-based matching (modifier_id stored directly on order_item)
+                    $modifierId = $orderItem->item_modifier_id;
+
+                    // Try ID-based matching first (most reliable - uses stored modifier_id)
+                    $result = CashierSubStock::deductForSaleById(
+                        $orderItem->item_id,
+                        $modifierId,
+                        $orderItem->quantity,
+                        Auth::id(),
+                        $order->order_number
+                    );
+
+                    // Fallback to name-based matching (for legacy orders without item_modifier_id)
+                    if (!$result && !$modifierId) {
+                        $displayName = $orderItem->item_display_name ?? $orderItem->item->name;
+                        $result = CashierSubStock::deductForSaleByDisplayName(
+                            $orderItem->item_id,
+                            $displayName,
+                            $orderItem->quantity,
+                            Auth::id()
+                        );
+                    }
+
+                    // Stock log is written inside CashierSubStock::deductForSaleById()
+                    // No duplicate log needed here
+                }
+            }
+
+            // Deduct raw materials for NON-Finished Goods items based on recipe
+            foreach ($orderItemsForStock as $orderItem) {
+                if (!$orderItem->item)
+                    continue;
+
+                // Only process non-finished goods items that have stock count enabled
+                if (!$orderItem->item->is_finished_goods && $orderItem->item->is_stock_count && $orderItem->quantity > 0) {
+                    // Use ID-based matching (modifier_id stored directly on order_item)
+                    $modifierId = $orderItem->item_modifier_id;
+
+                    // Get recipes - portion-specific if modifier exists
+                    $recipes = ItemRecipe::where('item_id', $orderItem->item_id)
+                        ->where('item_modifier_id', $modifierId)
+                        ->get();
+
+                    // Fallback to item-level recipes if no portion-specific recipes found
+                    if ($recipes->isEmpty() && $modifierId) {
+                        $recipes = ItemRecipe::where('item_id', $orderItem->item_id)
+                            ->whereNull('item_modifier_id')
+                            ->get();
+                    }
+
+                    // If no modifier, get item-level recipes directly
+                    if ($recipes->isEmpty() && !$modifierId) {
+                        $recipes = ItemRecipe::where('item_id', $orderItem->item_id)
+                            ->whereNull('item_modifier_id')
+                            ->get();
+                    }
+
+                    // Get excluded ingredients for this order item (if any)
+                    $excludedIngredientIds = $orderItem->excluded_ingredients ?? [];
+
+                    // Deduct each raw material from CashierSubStock
+                    foreach ($recipes as $recipe) {
+                        // Skip excluded ingredients (pork control)
+                        if (!empty($excludedIngredientIds) && in_array($recipe->main_stock_item_id, $excludedIngredientIds)) {
+                            Log::info('Skipping excluded ingredient for stock deduction', [
+                                'order_item_id' => $orderItem->id,
+                                'recipe_id' => $recipe->id,
+                                'main_stock_item_id' => $recipe->main_stock_item_id,
+                            ]);
+                            continue;
+                        }
+
+                        $totalQuantity = $recipe->quantity * $orderItem->quantity;
+                        $subStock = CashierSubStock::getOrCreateForItem($recipe->main_stock_item_id);
+                        $qtyBefore = (float) $subStock->quantity;
+                        $subStock->deductStockForSale($totalQuantity, Auth::id());
+
+                        // Log RM stock change
+                        CashierRmStockLog::log(
+                            $recipe->main_stock_item_id,
+                            'sale_deduct',
+                            $qtyBefore,
+                            (float) $subStock->quantity,
+                            'order',
+                            $order->order_number,
+                            'Recipe deduction for ' . ($orderItem->item_display_name ?? $orderItem->item->name) . ' - Qty: ' . $totalQuantity,
+                            Auth::id()
+                        );
+                    }
+                }
+            }
+
+            // Prepare items payload for receipt/printing
+            $printItemsRaw = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->with(['item', 'modifiers.modifier'])
+                ->get();
+
+            $printItems = $printItemsRaw->map(function ($orderItem) {
+                $modifiers = $orderItem->modifiers->map(function ($mod) {
+                    return [
+                        'id' => $mod->id,
+                        'modifier_id' => $mod->modifier_id,
+                        'name' => $mod->modifier->name ?? 'Modifier',
+                        'price_adjustment' => $mod->price_adjustment,
+                    ];
+                })->toArray();
+
+                return [
+                    'id' => $orderItem->id,
+                    'item_id' => $orderItem->item_id,
+                    'name' => $orderItem->item_display_name ?? $orderItem->item->name ?? 'Unknown Item',
+                    'item_name' => $orderItem->item_display_name ?? $orderItem->item->name ?? 'Unknown Item',
+                    'item_code' => $orderItem->item->item_code ?? '',
+                    'vat_available' => $orderItem->item->vat_available ?? false,
+                    'sscl_available' => $orderItem->item->sscl_available ?? false,
+                    'unit_price' => $orderItem->unit_price,
+                    'price' => $orderItem->unit_price,
+                    'quantity' => $orderItem->quantity,
+                    'subtotal' => $orderItem->subtotal,
+                    'status' => $orderItem->status,
+                    'modifiers' => $modifiers,
+                    'item' => [
+                        'name' => $orderItem->item->name ?? 'Unknown Item',
+                        'item_code' => $orderItem->item->item_code ?? '',
+                    ],
+                ];
+            })->values();
+
+            $order = $order->load(['payment', 'table', 'waiter']);
+            $order->setRelation('orderItems', $printItemsRaw);
+            $order->setAttribute('order_items', $printItems);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Payment processed successfully',
+                'order' => $order,
+                'order_items' => $printItems,
+                'orderItems' => $printItems,
+                'items' => $printItems,
+                'payment' => $payment,
+                'subtotal'    => $order->subtotal,
+                'sscl_amount' => $order->sscl_amount,
+                'vat_amount'  => $order->vat_amount,
+                'tax_amount'  => $order->tax_amount,
+                'total_amount' => $order->total_amount,
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Error processing payment: ' . $e->getMessage()
             ], 500);
         }
     }
@@ -181,9 +1682,712 @@ class POSController extends Controller
      */
     public function printReceipt($orderId)
     {
-        $order = Order::with(['items.item', 'table', 'waiter', 'payment'])
-            ->findOrFail($orderId);
+        $order = Order::with([
+            'orderItems' => function ($query) {
+                $query->where('status', '!=', 'deleted')
+                    ->orderBy('id', 'asc')  // Ensure consistent ordering
+                    ->with(['item', 'modifiers.modifier']);
+                // NO LIMIT - fetch ALL items for printing
+            },
+            'table',
+            'waiter',
+            'payment'
+        ])->findOrFail($orderId);
 
-        return view('pos.receipt', compact('order'));
+        $setting = \App\Models\Setting::first();
+        $vatRegNo = $setting ? ($setting->vat_reg_no ?? '') : '';
+
+        return view('pos.receipt', compact('order', 'vatRegNo'));
+    }
+
+    /**
+     * Verify supervisor PIN for void operations
+     * PIN is dynamically generated and changes every 5 minutes
+     */
+    public function verifySupervisorPin(Request $request)
+    {
+        $validated = $request->validate([
+            'pin' => 'required|string|size:4',
+        ]);
+
+        // Find all supervisors and check their dynamic PIN
+        $supervisors = \App\Models\User::whereHas('roles', function ($query) {
+            $query->where('name', 'supervisor');
+        })
+            ->where('is_active', true)
+            ->get();
+
+        foreach ($supervisors as $supervisor) {
+            // Check against the dynamically generated PIN
+            if ($supervisor->dynamic_pin === $validated['pin']) {
+                return response()->json([
+                    'success' => true,
+                    'message' => 'PIN verified successfully',
+                    'supervisor_name' => $supervisor->name
+                ]);
+            }
+        }
+
+        return response()->json([
+            'success' => false,
+            'message' => 'Invalid supervisor PIN'
+        ], 401);
+    }
+
+    /**
+     * Void items from an order (reduce quantity)
+     */
+    public function voidItems(Request $request)
+    {
+        $validated = $request->validate([
+            'order_id' => 'required|exists:orders,id',
+            'void_items' => 'required|array|min:1',
+            'void_items.*.item_id' => 'required|exists:items,id',
+            'void_items.*.modifier_id' => 'nullable|exists:item_modifiers,id', // For ID-based matching
+            'void_items.*.item_name' => 'required|string',
+            'void_items.*.void_quantity' => 'required|integer|min:1',
+            'supervisor_pin' => 'required|string|size:4',
+        ]);
+
+        // Verify supervisor PIN again using dynamic PIN
+        $supervisors = \App\Models\User::whereHas('roles', function ($query) {
+            $query->where('name', 'supervisor');
+        })
+            ->where('is_active', true)
+            ->get();
+
+        $supervisor = null;
+        foreach ($supervisors as $sup) {
+            if ($sup->dynamic_pin === $validated['supervisor_pin']) {
+                $supervisor = $sup;
+                break;
+            }
+        }
+
+        if (!$supervisor) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Invalid supervisor PIN'
+            ], 401);
+        }
+
+        DB::beginTransaction();
+        try {
+            $order = Order::with('orderItems.item')->findOrFail($validated['order_id']);
+
+            $voidedItems = [];
+            $cancelKotItems = []; // Items to print on cancel KOT
+
+            foreach ($validated['void_items'] as $voidItem) {
+                // Find the matching order item using ID-based matching (item_id + modifier_id)
+                $modifierId = $voidItem['modifier_id'] ?? null;
+                $orderItem = $order->orderItems->filter(function ($item) use ($voidItem, $modifierId) {
+                    // Match by item_id
+                    if ($item->item_id != $voidItem['item_id']) {
+                        return false;
+                    }
+                    // Match by modifier_id (ID-based matching - most reliable)
+                    if ($modifierId !== null) {
+                        if ($item->item_modifier_id != $modifierId) {
+                            return false;
+                        }
+                    } else {
+                        // Fallback to name matching for legacy orders without modifier_id
+                        $itemName = $item->item_display_name ?? ($item->item->name ?? '');
+                        if ($itemName !== $voidItem['item_name']) {
+                            return false;
+                        }
+                    }
+                    // Exclude cancelled/deleted items
+                    if (in_array($item->status, ['cancelled', 'deleted'])) {
+                        return false;
+                    }
+                    return true;
+                })->first();
+
+                if (!$orderItem) {
+                    continue; // Skip if item not found
+                }
+
+                $currentQty = $orderItem->quantity;
+                $voidQty = min($voidItem['void_quantity'], $currentQty);
+                $newQty = $currentQty - $voidQty;
+                $unitPrice = $orderItem->unit_price;
+                $voidedAmount = $voidQty * $unitPrice;
+
+                if ($newQty <= 0) {
+                    // Mark as cancelled
+                    $orderItem->update([
+                        'status' => 'cancelled',
+                        'quantity' => 0,
+                        'subtotal' => 0,
+                        'latest_added_quantity' => 0,
+                        'delivered_quantity' => 0,
+                        'delivered_at' => null,
+                    ]);
+                } else {
+                    // Reduce quantity
+                    $trackingUpdate = $orderItem->quantityDecreaseTrackingAttributes($newQty);
+                    $orderItem->update(array_merge($trackingUpdate, [
+                        'quantity' => $newQty,
+                        'subtotal' => $unitPrice * $newQty
+                    ]));
+                }
+
+                // Create void record for audit trail
+                $voidRecord = VoidRecord::create([
+                    'void_number' => VoidRecord::generateVoidNumber(),
+                    'order_id' => $order->id,
+                    'order_number' => $order->order_number,
+                    'item_id' => $voidItem['item_id'],
+                    'order_item_id' => $orderItem->id,
+                    'item_name' => $voidItem['item_name'],
+                    'item_code' => $orderItem->item->item_code ?? null,
+                    'voided_quantity' => $voidQty,
+                    'unit_price' => $unitPrice,
+                    'voided_amount' => $voidedAmount,
+                    'cashier_id' => Auth::id(),
+                    'supervisor_id' => $supervisor->id,
+                    'supervisor_name' => $supervisor->name,
+                    'reason' => $request->input('reason'), // Optional reason from frontend
+                    'table_number' => $order->table?->table_number,
+                    'cancel_kot_number' => null, // Will be updated after KOT creation
+                ]);
+
+                $voidedItems[] = [
+                    'item_id' => $voidItem['item_id'],
+                    'item_name' => $voidItem['item_name'],
+                    'voided_quantity' => $voidQty,
+                    'new_quantity' => $newQty,
+                    'voided_amount' => $voidedAmount,
+                    'void_number' => $voidRecord->void_number,
+                ];
+
+                // Add to cancel KOT items
+                $cancelKotItems[] = [
+                    'name' => $voidItem['item_name'],
+                    'quantity' => $voidQty,
+                    'item_id' => $voidItem['item_id'],
+                    'is_cancelled' => true,
+                    'void_record_id' => $voidRecord->id,
+                ];
+            }
+
+            // Recalculate order totals after void (with full tax breakdown)
+            $order->refresh();
+            $activeOrderItems = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->with('item')
+                ->get();
+
+            $taxTotals = $this->taxService->calculateOrderTax($activeOrderItems);
+
+            $order->update([
+                'subtotal'     => $taxTotals['subtotal'],
+                'sscl_amount'  => $taxTotals['sscl_amount'],
+                'vat_amount'   => $taxTotals['vat_amount'],
+                'tax_amount'   => $taxTotals['tax_amount'],
+                'total_amount' => $taxTotals['total_amount'],
+            ]);
+
+            // Create a Cancel KOT for voided items
+            $cancelKotNumber = null;
+            $cancelBotNumber = null;
+
+            if (!empty($cancelKotItems)) {
+                // Separate kitchen and bar items
+                $kitchenCancelItems = [];
+                $barCancelItems = [];
+
+                foreach ($cancelKotItems as $cancelItem) {
+                    $item = Item::with('category')->find($cancelItem['item_id']);
+                    if ($item) {
+                        // Only Beverages (ID 21) go to Cancel BOT
+                        // Desserts and all other categories go to Cancel KOT
+                        $isBarItem = false;
+                        if ($item->category_id === 21) {
+                            $isBarItem = true;
+                        } elseif ($item->category) {
+                            // Fallback: check by slug/name for flexibility
+                            $categorySlug = strtolower($item->category->slug);
+                            $categoryName = strtoupper($item->category->name);
+                            $isBarItem = (
+                                $categorySlug === 'beverages' || $categoryName === 'BEVERAGES'
+                            );
+                        }
+
+                        if ($isBarItem) {
+                            $barCancelItems[] = $cancelItem;
+                        } else {
+                            $kitchenCancelItems[] = $cancelItem;
+                        }
+                    }
+                }
+
+                // Create Cancel KOT for kitchen items
+                if (!empty($kitchenCancelItems)) {
+                    $cancelKot = Kot::create([
+                        'order_id' => $order->id,
+                        'table_id' => $order->table_id,
+                        'waiter_id' => Auth::id(),
+                        'kitchen_station_id' => 1,
+                        'status' => 'cancelled',
+                        'printed_at' => now(),
+                        'print_count' => 1,
+                    ]);
+                    // Use getDisplayNumber() to include sub-number if applicable
+                    $cancelKotNumber = 'CANCEL-' . $cancelKot->getDisplayNumber();
+
+                    // Update void records with cancel KOT number
+                    foreach ($kitchenCancelItems as $cancelItem) {
+                        if (isset($cancelItem['void_record_id'])) {
+                            VoidRecord::where('id', $cancelItem['void_record_id'])
+                                ->update(['cancel_kot_number' => $cancelKotNumber]);
+                        }
+                    }
+                }
+
+                // Create Cancel BOT for bar items
+                if (!empty($barCancelItems)) {
+                    $cancelBot = Kot::create([
+                        'order_id' => $order->id,
+                        'table_id' => $order->table_id,
+                        'waiter_id' => Auth::id(),
+                        'kitchen_station_id' => 2,
+                        'status' => 'cancelled',
+                        'printed_at' => now(),
+                        'print_count' => 1,
+                    ]);
+                    // Use getDisplayNumber() to include sub-number if applicable
+                    $cancelBotNumber = 'CANCEL-' . $cancelBot->getDisplayNumber();
+
+                    // Update void records with cancel BOT number
+                    foreach ($barCancelItems as $cancelItem) {
+                        if (isset($cancelItem['void_record_id'])) {
+                            VoidRecord::where('id', $cancelItem['void_record_id'])
+                                ->update(['cancel_kot_number' => $cancelBotNumber]);
+                        }
+                    }
+                }
+            }
+
+            // Load updated items for frontend
+            $updatedItems = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->with('item')
+                ->get()
+                ->map(function ($orderItem) {
+                    return [
+                        'item_id' => $orderItem->item_id,
+                        'name' => $orderItem->item_display_name ?? $orderItem->item->name ?? 'Unknown Item',
+                        'price' => $orderItem->unit_price,
+                        'vat_available' => $orderItem->item->vat_available ?? false,
+                        'sscl_available' => $orderItem->item->sscl_available ?? false,
+                        'quantity' => $orderItem->quantity,
+                        'subtotal' => $orderItem->subtotal,
+                    ];
+                })->values();
+
+            // Check if all items have been voided (no active items remaining)
+            // We don't cancel immediately - user can still add new items
+            // Order will be cancelled only when user starts a new order without adding items
+            $allItemsVoided = $updatedItems->isEmpty();
+
+            // Log the void operation
+            OrderLog::logAction($order, OrderLog::ACTION_ITEM_REMOVED, [
+                'reason' => $request->input('reason') ?? 'Items voided by supervisor: ' . $supervisor->name,
+                'old_values' => [
+                    'voided_items' => $voidedItems,
+                    'supervisor_id' => $supervisor->id,
+                    'supervisor_name' => $supervisor->name,
+                ],
+                'description' => count($voidedItems) . ' item(s) voided by supervisor ' . $supervisor->name,
+            ]);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => $allItemsVoided ? 'All items voided - Add new items or start a new order' : 'Items voided successfully',
+                'voided_items' => $voidedItems,
+                'updated_items' => $updatedItems,
+                'new_total' => $order->total_amount,
+                'cancel_kot_number' => $cancelKotNumber,
+                'cancel_bot_number' => $cancelBotNumber,
+                'cancel_kot_items' => $kitchenCancelItems ?? [],
+                'cancel_bot_items' => $barCancelItems ?? [],
+                'supervisor_name' => $supervisor->name,
+                'all_items_voided' => $allItemsVoided,
+                'order_id' => $order->id
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Error voiding items: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Cancel a voided order when user starts a new order without adding items
+     * This is called when user had voided all items and then starts a fresh order
+     */
+    public function cancelVoidedOrder(Request $request)
+    {
+        $validated = $request->validate([
+            'order_id' => 'required|exists:orders,id',
+        ]);
+
+        DB::beginTransaction();
+        try {
+            $order = Order::with('orderItems')->findOrFail($validated['order_id']);
+
+            // Check if order has any active items
+            $activeItemsCount = $order->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->count();
+
+            if ($activeItemsCount > 0) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Order still has active items. Cannot cancel.'
+                ], 400);
+            }
+
+            // Cancel the order
+            $oldStatus = $order->status;
+            $order->update([
+                'status' => 'cancelled',
+                'cancelled_at' => now(),
+                'cancelled_by' => Auth::id(),
+                'cancellation_reason' => 'All items voided - New order started',
+            ]);
+
+            // Log the cancellation
+            OrderLog::logStatusChanged($order, $oldStatus, 'cancelled', 'All items voided - New order started');
+            OrderLog::logDeleted($order, 'Order cancelled after all items were voided');
+
+            // Free up the table if dine-in
+            if ($order->table_id) {
+                $table = Table::find($order->table_id);
+                if ($table) {
+                    $table->update([
+                        'status' => 'available',
+                        'current_order_id' => null,
+                    ]);
+                }
+            }
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Voided order cancelled successfully',
+                'order_id' => $order->id
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Error cancelling voided order: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Transfer an order to a different table
+     */
+    public function transferTable(Request $request)
+    {
+        $validated = $request->validate([
+            'order_id' => 'required|exists:orders,id',
+            'new_table_id' => 'required|exists:tables,id',
+        ]);
+
+        DB::beginTransaction();
+        try {
+            $order = Order::with('table')->findOrFail($validated['order_id']);
+
+            // Validate order type
+            if ($order->order_type !== 'dine_in') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Only dine-in orders can be transferred'
+                ], 400);
+            }
+
+            // Validate order status
+            if ($order->is_paid || $order->status === 'completed') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot transfer a completed or paid order'
+                ], 400);
+            }
+
+            // Get the old and new tables
+            $oldTable = Table::find($order->table_id);
+            $newTable = Table::findOrFail($validated['new_table_id']);
+
+            // Check if new table is available
+            if ($newTable->status !== 'available') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'The selected table is not available'
+                ], 400);
+            }
+
+            // Check if trying to transfer to the same table
+            if ($order->table_id === $validated['new_table_id']) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Order is already on this table'
+                ], 400);
+            }
+
+            // Free up the old table
+            if ($oldTable) {
+                $oldTable->update([
+                    'status' => 'available',
+                    'current_order_id' => null,
+                ]);
+            }
+
+            // Reserve the new table
+            $newTable->update([
+                'status' => 'ordered',
+                'current_order_id' => $order->id,
+            ]);
+
+            // Update the order's table
+            $oldTableId = $order->table_id;
+            $order->update([
+                'table_id' => $validated['new_table_id'],
+            ]);
+
+            // Log the table transfer
+            OrderLog::logTableChanged(
+                $order,
+                $oldTableId,
+                $validated['new_table_id'],
+                'Order transferred from ' . ($oldTable ? $oldTable->table_number : 'N/A') . ' to ' . $newTable->table_number
+            );
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Table transferred successfully',
+                'order' => $order->load('table'),
+                'old_table' => $oldTable ? $oldTable->table_number : null,
+                'new_table' => $newTable->table_number,
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Error transferring table: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Merge two orders - move items from source order to target order
+     */
+    public function mergeOrder(Request $request)
+    {
+        $validated = $request->validate([
+            'target_order_id' => 'required|exists:orders,id',
+            'source_order_id' => 'required|exists:orders,id',
+        ]);
+
+        // Prevent merging the same order
+        if ($validated['target_order_id'] === $validated['source_order_id']) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Cannot merge an order with itself'
+            ], 400);
+        }
+
+        DB::beginTransaction();
+        try {
+            $targetOrder = Order::with('orderItems.item')->findOrFail($validated['target_order_id']);
+            $sourceOrder = Order::with('orderItems.item')->findOrFail($validated['source_order_id']);
+
+            // Validate both orders are pending and not paid
+            if ($targetOrder->is_paid || $targetOrder->status === 'completed') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot merge into a completed or paid order'
+                ], 400);
+            }
+
+            if ($sourceOrder->is_paid || $sourceOrder->status === 'completed') {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Cannot merge a completed or paid order'
+                ], 400);
+            }
+
+            // Get active items from source order
+            $sourceItems = $sourceOrder->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->get();
+
+            if ($sourceItems->isEmpty()) {
+                return response()->json([
+                    'success' => false,
+                    'message' => 'Source order has no active items to merge'
+                ], 400);
+            }
+
+            // Move items from source to target
+            foreach ($sourceItems as $sourceItem) {
+                // Check if similar item already exists in target order (same item_id and modifier_id)
+                $existingItem = $targetOrder->orderItems()
+                    ->where('item_id', $sourceItem->item_id)
+                    ->where('item_modifier_id', $sourceItem->item_modifier_id)
+                    ->where('item_display_name', $sourceItem->item_display_name)
+                    ->whereNotIn('status', ['cancelled', 'deleted'])
+                    ->first();
+
+                if ($existingItem) {
+                    // Merge quantities for existing item
+                    $newQuantity = $existingItem->quantity + $sourceItem->quantity;
+                    $newSubtotal = $existingItem->unit_price * $newQuantity;
+
+                    $trackingUpdate = $existingItem->quantityIncreaseTrackingAttributes($newQuantity);
+
+                    $existingItem->update(array_merge($trackingUpdate, [
+                        'quantity' => $newQuantity,
+                        'subtotal' => $newSubtotal
+                    ]));
+
+                    // Mark source item as merged/cancelled
+                    $sourceItem->update([
+                        'status' => 'cancelled',
+                        'quantity' => 0,
+                        'subtotal' => 0,
+                        'latest_added_quantity' => 0,
+                        'delivered_quantity' => 0,
+                        'delivered_at' => null,
+                    ]);
+                } else {
+                    // Move item to target order
+                    $sourceItem->update([
+                        'order_id' => $targetOrder->id
+                    ]);
+                }
+            }
+
+            // Recalculate target order totals (with full tax breakdown)
+            $targetOrder->refresh();
+            $activeTargetItems = $targetOrder->orderItems()
+                ->whereNotIn('status', ['cancelled', 'deleted'])
+                ->with('item')
+                ->get();
+
+            $taxTotals = $this->taxService->calculateOrderTax($activeTargetItems);
+
+            $targetOrder->update([
+                'subtotal'     => $taxTotals['subtotal'],
+                'sscl_amount'  => $taxTotals['sscl_amount'],
+                'vat_amount'   => $taxTotals['vat_amount'],
+                'tax_amount'   => $taxTotals['tax_amount'],
+                'total_amount' => $taxTotals['total_amount'],
+            ]);
+
+            // Cancel the source order
+            $sourceOrder->update([
+                'status' => 'cancelled',
+                'cancelled_at' => now(),
+                'cancelled_by' => Auth::id(),
+                'cancellation_reason' => 'Merged into Order #' . $targetOrder->order_number,
+                'subtotal'     => 0,
+                'sscl_amount'  => 0,
+                'vat_amount'   => 0,
+                'tax_amount'   => 0,
+                'total_amount' => 0,
+            ]);
+
+            // Free up the source table if dine-in
+            if ($sourceOrder->table_id) {
+                $sourceTable = Table::find($sourceOrder->table_id);
+                if ($sourceTable) {
+                    $sourceTable->update([
+                        'status' => 'available',
+                        'current_order_id' => null,
+                    ]);
+                }
+            }
+
+            // Log the merge operation on target order
+            OrderLog::logMerged($targetOrder, $sourceOrder->id, 'Order #' . $sourceOrder->order_number . ' merged into this order');
+
+            // Log the cancellation on source order
+            OrderLog::logStatusChanged($sourceOrder, 'pending', 'cancelled', 'Merged into Order #' . $targetOrder->order_number);
+            OrderLog::logDeleted($sourceOrder, 'Order cancelled after being merged into Order #' . $targetOrder->order_number);
+
+            DB::commit();
+
+            return response()->json([
+                'success' => true,
+                'message' => 'Order #' . $sourceOrder->order_number . ' merged into Order #' . $targetOrder->order_number . ' successfully',
+                'target_order' => $targetOrder->load('orderItems.item'),
+                'new_total' => $targetOrder->total_amount,
+                'merged_items_count' => $sourceItems->count(),
+            ]);
+        } catch (\Exception $e) {
+            DB::rollBack();
+            return response()->json([
+                'success' => false,
+                'message' => 'Error merging orders: ' . $e->getMessage()
+            ], 500);
+        }
+    }
+
+    /**
+     * Get order activity logs
+     */
+    public function getOrderLogs($orderId)
+    {
+        try {
+            $order = Order::with(['logs.performedBy'])->findOrFail($orderId);
+
+            $logs = $order->logs->map(function ($log) {
+                return [
+                    'id' => $log->id,
+                    'action' => $log->action,
+                    'action_label' => $log->action_label,
+                    'action_color' => $log->action_color,
+                    'old_status' => $log->old_status,
+                    'new_status' => $log->new_status,
+                    'reason' => $log->reason,
+                    'description' => $log->description,
+                    'old_values' => $log->old_values,
+                    'new_values' => $log->new_values,
+                    'performed_by' => $log->performedBy ? [
+                        'id' => $log->performedBy->id,
+                        'name' => $log->performedBy->name,
+                    ] : null,
+                    'ip_address' => $log->ip_address,
+                    'created_at' => $log->created_at->format('M d, Y h:i:s A'),
+                    'created_at_human' => $log->created_at->diffForHumans(),
+                ];
+            });
+
+            return response()->json([
+                'success' => true,
+                'order_id' => $order->id,
+                'order_number' => $order->order_number,
+                'logs' => $logs,
+                'total_logs' => $logs->count(),
+            ]);
+        } catch (\Exception $e) {
+            return response()->json([
+                'success' => false,
+                'message' => 'Error fetching order logs: ' . $e->getMessage()
+            ], 500);
+        }
     }
 }

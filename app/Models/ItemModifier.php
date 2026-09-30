@@ -17,19 +17,51 @@ class ItemModifier extends Model
         'type',
         'price_adjustment',
         'is_active',
+        'pork_available',
+        'status',
     ];
 
     protected $casts = [
         'price_adjustment' => 'decimal:2',
         'is_active' => 'boolean',
+        'pork_available' => 'boolean',
+        'status' => 'integer',
     ];
+
+    /**
+     * Boot method to add global active scope.
+     */
+    protected static function boot()
+    {
+        parent::boot();
+
+        static::addGlobalScope('active', function ($builder) {
+            $builder->where('status', 1);
+        });
+
+        static::updated(function ($modifier) {
+            if ($modifier->wasChanged('price_adjustment')) {
+                $previous = $modifier->getOriginal('price_adjustment');
+                $new = $modifier->price_adjustment;
+                if ($previous !== null && (float)$previous !== (float)$new) {
+                    \App\Models\PriceListActivity::create([
+                        'item_id' => $modifier->item_id,
+                        'item_portion_id' => $modifier->id,
+                        'previous_price' => $previous,
+                        'new_price' => $new,
+                        'updated_by' => auth()->id(),
+                    ]);
+                }
+            }
+        });
+    }
 
     /**
      * Get the item.
      */
     public function item(): BelongsTo
     {
-        return $this->belongsTo(Item::class);
+        return $this->belongsTo(Item::class)->withoutGlobalScope('active');
     }
 
     /**
@@ -38,6 +70,31 @@ class ItemModifier extends Model
     public function orderItemModifiers(): HasMany
     {
         return $this->hasMany(OrderItemModifier::class, 'modifier_id');
+    }
+
+    /**
+     * Get the item prices for this modifier.
+     */
+    public function itemPrices(): HasMany
+    {
+        return $this->hasMany(ItemPrice::class);
+    }
+
+    /**
+     * Get price by type for this modifier (pickme, ubereats, etc.).
+     * Returns the special price if exists, otherwise returns the default price_adjustment from item_modifiers table.
+     */
+    public function getPriceByType($type)
+    {
+        if (!$type || $type === 'default') {
+            return $this->price_adjustment;
+        }
+
+        $itemPrice = $this->itemPrices()
+            ->where('price_type', $type)
+            ->first();
+
+        return $itemPrice ? $itemPrice->price : $this->price_adjustment;
     }
 
     /**
@@ -54,5 +111,13 @@ class ItemModifier extends Model
     public function scopeOfType($query, $type)
     {
         return $query->where('type', $type);
+    }
+
+    /**
+     * Get the recipes for this modifier/portion.
+     */
+    public function recipes(): HasMany
+    {
+        return $this->hasMany(ItemRecipe::class);
     }
 }

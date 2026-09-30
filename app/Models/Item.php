@@ -24,7 +24,13 @@ class Item extends Model
         'preparation_time',
         'is_available',
         'is_featured',
+        'is_finished_goods',
+        'is_stock_count',
+        'vat_available',
+        'sscl_available',
+        'pork_available',
         'display_order',
+        'status',
     ];
 
     protected $casts = [
@@ -33,7 +39,13 @@ class Item extends Model
         'preparation_time' => 'integer',
         'is_available' => 'boolean',
         'is_featured' => 'boolean',
+        'is_finished_goods' => 'boolean',
+        'is_stock_count' => 'boolean',
+        'vat_available' => 'boolean',
+        'sscl_available' => 'boolean',
+        'pork_available' => 'boolean',
         'display_order' => 'integer',
+        'status' => 'integer',
     ];
 
     /**
@@ -46,6 +58,26 @@ class Item extends Model
         static::creating(function ($item) {
             if (empty($item->slug)) {
                 $item->slug = Str::slug($item->name);
+            }
+        });
+
+        static::addGlobalScope('active', function ($builder) {
+            $builder->where('status', 1);
+        });
+
+        static::updated(function ($item) {
+            if ($item->wasChanged('price')) {
+                $previous = $item->getOriginal('price');
+                $new = $item->price;
+                if ($previous !== null && (float)$previous !== (float)$new) {
+                    \App\Models\PriceListActivity::create([
+                        'item_id' => $item->id,
+                        'item_portion_id' => null,
+                        'previous_price' => $previous,
+                        'new_price' => $new,
+                        'updated_by' => auth()->id(),
+                    ]);
+                }
             }
         });
     }
@@ -72,6 +104,32 @@ class Item extends Model
     public function modifiers(): HasMany
     {
         return $this->hasMany(ItemModifier::class);
+    }
+
+    /**
+     * Get the item prices.
+     */
+    public function itemPrices(): HasMany
+    {
+        return $this->hasMany(ItemPrice::class);
+    }
+
+    /**
+     * Get price by type (pickme, ubereats, etc.).
+     * Returns the special price if exists, otherwise returns the default price from items table.
+     */
+    public function getPriceByType($type)
+    {
+        if (!$type || $type === 'default') {
+            return $this->price;
+        }
+
+        $itemPrice = $this->itemPrices()
+            ->where('price_type', $type)
+            ->whereNull('item_modifier_id')
+            ->first();
+
+        return $itemPrice ? $itemPrice->price : $this->price;
     }
 
     /**
@@ -131,5 +189,21 @@ class Item extends Model
             return (($this->price - $this->cost_price) / $this->cost_price) * 100;
         }
         return null;
+    }
+
+    /**
+     * Get the recipes for this item.
+     */
+    public function recipes(): HasMany
+    {
+        return $this->hasMany(ItemRecipe::class);
+    }
+
+    /**
+     * Get item-level recipes only (not portion-specific).
+     */
+    public function itemRecipes(): HasMany
+    {
+        return $this->hasMany(ItemRecipe::class)->whereNull('item_modifier_id');
     }
 }

@@ -13,6 +13,7 @@ class Kot extends Model
 
     protected $fillable = [
         'kot_number',
+        'sub_number',
         'order_id',
         'kitchen_station_id',
         'table_id',
@@ -25,12 +26,14 @@ class Kot extends Model
 
     protected $casts = [
         'print_count' => 'integer',
+        'sub_number' => 'integer',
         'printed_at' => 'datetime',
         'completed_at' => 'datetime',
     ];
 
     /**
      * Boot method to generate KOT number.
+     * For sub-KOTs (additions to existing order), uses the SAME base kot_number.
      */
     protected static function boot()
     {
@@ -38,20 +41,87 @@ class Kot extends Model
 
         static::creating(function ($kot) {
             if (empty($kot->kot_number)) {
-                $kot->kot_number = static::generateKotNumber();
+                // Determine if this is a BOT (Bar Order Ticket) based on kitchen_station_id
+                $isBar = $kot->kitchen_station_id == 2;
+
+                // Check if there's an existing KOT for this order and station
+                // If yes, use the same kot_number (this is a sub-KOT/addition)
+                $existingKotNumber = static::getExistingKotNumber($kot->order_id, $kot->kitchen_station_id);
+
+                if ($existingKotNumber) {
+                    // Use the same base KOT number for additions
+                    $kot->kot_number = $existingKotNumber;
+                } else {
+                    // Generate a new KOT number for the first KOT
+                    $kot->kot_number = static::generateKotNumber($isBar);
+                }
             }
         });
     }
 
     /**
-     * Generate unique KOT number.
+     * Get the existing KOT number for an order and station (if any).
+     * Returns the kot_number of the first (primary) KOT, or null if none exists.
      */
-    public static function generateKotNumber(): string
+    public static function getExistingKotNumber(int $orderId, int $stationId): ?string
     {
-        $prefix = 'KOT';
+        $firstKot = static::where('order_id', $orderId)
+            ->where('kitchen_station_id', $stationId)
+            ->where('sub_number', 0) // Get the primary KOT
+            ->first();
+
+        return $firstKot ? $firstKot->kot_number : null;
+    }
+
+    /**
+     * Generate unique KOT/BOT number with separate sequences.
+     */
+    public static function generateKotNumber(bool $isBar = false): string
+    {
+        $prefix = $isBar ? 'BOT' : 'KOT';
         $date = now()->format('Ymd');
-        $count = static::whereDate('created_at', today())->count() + 1;
+
+        // Count only unique kot_numbers (not counting sub-KOTs which share the same number)
+        // We count distinct kot_numbers to get the proper sequence
+        $count = static::whereDate('created_at', today())
+            ->where('kot_number', 'like', $prefix . '-%')
+            ->where('sub_number', 0) // Only count primary KOTs for proper sequencing
+            ->count() + 1;
+
         return sprintf('%s-%s-%04d', $prefix, $date, $count);
+    }
+
+    /**
+     * Get the next sub-number for this order and station.
+     * Returns 0 for primary KOT/BOT, 1+ for subsequent additions.
+     */
+    public static function getNextSubNumber(int $orderId, int $stationId): int
+    {
+        $maxSubNumber = static::where('order_id', $orderId)
+            ->where('kitchen_station_id', $stationId)
+            ->max('sub_number');
+
+        return ($maxSubNumber === null) ? 0 : ($maxSubNumber + 1);
+    }
+
+    /**
+     * Check if this is a primary KOT/BOT (first items for the order).
+     */
+    public function isPrimary(): bool
+    {
+        return $this->sub_number === 0;
+    }
+
+    /**
+     * Get the display number including sub-number if applicable.
+     * Format: KOT-YYYYMMDD-XXXX or KOT-YYYYMMDD-XXXX-N (for sub-KOTs)
+     */
+    public function getDisplayNumber(): string
+    {
+        if ($this->sub_number > 0) {
+            return $this->kot_number . '-' . $this->sub_number;
+        }
+        return $this->kot_number;
     }
 
     /**

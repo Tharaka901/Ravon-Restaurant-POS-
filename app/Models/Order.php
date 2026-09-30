@@ -17,9 +17,13 @@ class Order extends Model
         'table_id',
         'order_type',
         'status',
+        'is_paid',
+        'is_deleted',
         'waiter_id',
         'customer_name',
+        'customer_vat_number',
         'customer_phone',
+        'pickme_ref_number',
         'guest_count',
         'subtotal',
         'discount_amount',
@@ -27,6 +31,8 @@ class Order extends Model
         'discount_reason',
         'service_charge',
         'tax_amount',
+        'sscl_amount',
+        'vat_amount',
         'delivery_fee',
         'total_amount',
         'special_instructions',
@@ -39,10 +45,14 @@ class Order extends Model
 
     protected $casts = [
         'guest_count' => 'integer',
+        'is_paid' => 'boolean',
+        'is_deleted' => 'boolean',
         'subtotal' => 'decimal:2',
         'discount_amount' => 'decimal:2',
         'service_charge' => 'decimal:2',
         'tax_amount' => 'decimal:2',
+        'sscl_amount' => 'decimal:2',
+        'vat_amount' => 'decimal:2',
         'delivery_fee' => 'decimal:2',
         'total_amount' => 'decimal:2',
         'completed_at' => 'datetime',
@@ -108,12 +118,22 @@ class Order extends Model
 
     /**
      * Get order items.
+     * Returns ALL order items with no limit - essential for printing complete receipts.
      */
     public function orderItems(): HasMany
     {
-        return $this->hasMany(OrderItem::class);
+        return $this->hasMany(OrderItem::class)->orderBy('id', 'asc');
     }
-
+    /**
+     * Get active (non-deleted) order items.
+     * Returns ALL active items with no limit - essential for printing complete receipts.
+     */
+    public function activeItems(): HasMany
+    {
+        return $this->hasMany(OrderItem::class)
+            ->where('status', '!=', 'deleted')
+            ->orderBy('id', 'asc');
+    }
     /**
      * Get KOTs.
      */
@@ -123,19 +143,19 @@ class Order extends Model
     }
 
     /**
+     * Get order activity logs.
+     */
+    public function logs(): HasMany
+    {
+        return $this->hasMany(OrderLog::class)->orderBy('created_at', 'desc');
+    }
+
+    /**
      * Get payment.
      */
     public function payment(): HasOne
     {
         return $this->hasOne(Payment::class);
-    }
-
-    /**
-     * Get delivery order.
-     */
-    public function deliveryOrder(): HasOne
-    {
-        return $this->hasOne(DeliveryOrder::class);
     }
 
     /**
@@ -207,11 +227,11 @@ class Order extends Model
      */
     public function calculateTotal(): void
     {
-        $this->subtotal = $this->orderItems->sum('subtotal');
-        $this->total_amount = $this->subtotal 
-            - $this->discount_amount 
-            + $this->service_charge 
-            + $this->tax_amount 
+        $this->subtotal = $this->activeItems->sum('subtotal');
+        $this->total_amount = $this->subtotal
+            - $this->discount_amount
+            + $this->service_charge
+            + $this->tax_amount
             + $this->delivery_fee;
         $this->save();
     }
